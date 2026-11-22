@@ -101,6 +101,15 @@ pub fn client_config(pin: Option<[u8; 32]>) -> rustls::ClientConfig {
     }
 }
 
+/// An HTTP client trusting the web roots (ring, no system TLS).
+pub fn http_client(timeout: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(client_config(None))
+        .timeout(timeout)
+        .build()
+        .expect("a client with a rustls configuration always builds")
+}
+
 #[cfg(test)]
 pub mod testutil {
     //! A self-signed certificate and a TLS acceptor for fake backends.
