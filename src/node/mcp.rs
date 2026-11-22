@@ -18,7 +18,10 @@ use crate::proto::{
 
 /// The caller's key and request event, as the Nostr transport hands them over.
 pub fn caller_from(ext: &Extensions) -> Caller {
-    Caller { pubkey: ext.get::<ClientPubkey>().map(|p| p.0.clone()), event: ext.get::<InboundEvent>().map(|e| e.0.clone()) }
+    Caller {
+        pubkey: ext.get::<ClientPubkey>().map(|p| p.0.clone()),
+        event: ext.get::<InboundEvent>().map(|e| e.0.clone()),
+    }
 }
 
 /// A JSON-RPC error carrying the refusal's code in `data.code`.
@@ -45,61 +48,107 @@ pub struct NodeServer {
 
 impl NodeServer {
     pub fn new(svc: Arc<Service>) -> Self {
-        NodeServer { svc, router: Self::tool_router() }
+        NodeServer {
+            svc,
+            router: Self::tool_router(),
+        }
     }
 }
 
 #[tool_router]
 impl NodeServer {
-    #[tool(name = "list_addresses", description = "The Lightning addresses this node serves, with their limits.")]
+    #[tool(
+        name = "list_addresses",
+        description = "The Lightning addresses this node serves, with their limits."
+    )]
     async fn list_addresses(&self, ctx: RequestContext<RoleServer>) -> Result<Json<AddressList>, ErrorData> {
-        self.svc.list_addresses(&caller_from(&ctx.extensions)).map(Json).map_err(rpc_error)
+        self.svc
+            .list_addresses(&caller_from(&ctx.extensions))
+            .map(Json)
+            .map_err(rpc_error)
     }
 
-    #[tool(name = "make_invoice", description = "Make an invoice for name@domain that commits to its LUD-06 metadata.")]
+    #[tool(
+        name = "make_invoice",
+        description = "Make an invoice for name@domain that commits to its LUD-06 metadata."
+    )]
     async fn make_invoice(
         &self,
         Parameters(p): Parameters<MakeInvoiceParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<MadeInvoice>, ErrorData> {
-        self.svc.make_invoice(&caller_from(&ctx.extensions), p).await.map(Json).map_err(rpc_error)
+        self.svc
+            .make_invoice(&caller_from(&ctx.extensions), p)
+            .await
+            .map(Json)
+            .map_err(rpc_error)
     }
 
-    #[tool(name = "get_status", description = "Admins only: backend, counters, last error and uptime.")]
+    #[tool(
+        name = "get_status",
+        description = "Admins only: backend, counters, last error and uptime."
+    )]
     async fn get_status(&self, ctx: RequestContext<RoleServer>) -> Result<Json<Status>, ErrorData> {
-        self.svc.status(&caller_from(&ctx.extensions)).map(Json).map_err(rpc_error)
+        self.svc
+            .status(&caller_from(&ctx.extensions))
+            .map(Json)
+            .map_err(rpc_error)
     }
 
-    #[tool(name = "get_config", description = "Admins only: the configuration in effect, without secrets.")]
+    #[tool(
+        name = "get_config",
+        description = "Admins only: the configuration in effect, without secrets."
+    )]
     async fn get_config(&self, ctx: RequestContext<RoleServer>) -> Result<Json<ConfigView>, ErrorData> {
-        self.svc.config_view(&caller_from(&ctx.extensions)).map(Json).map_err(rpc_error)
+        self.svc
+            .config_view(&caller_from(&ctx.extensions))
+            .map(Json)
+            .map_err(rpc_error)
     }
 
-    #[tool(name = "set_address", description = "Admins only, when remote settings are on: add or change an address.")]
+    #[tool(
+        name = "set_address",
+        description = "Admins only, when remote settings are on: add or change an address."
+    )]
     async fn set_address(
         &self,
         Parameters(p): Parameters<SetAddressParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ConfigView>, ErrorData> {
-        self.svc.set_address(&caller_from(&ctx.extensions), p).map(Json).map_err(rpc_error)
+        self.svc
+            .set_address(&caller_from(&ctx.extensions), p)
+            .map(Json)
+            .map_err(rpc_error)
     }
 
-    #[tool(name = "remove_address", description = "Admins only, when remote settings are on: stop serving an address.")]
+    #[tool(
+        name = "remove_address",
+        description = "Admins only, when remote settings are on: stop serving an address."
+    )]
     async fn remove_address(
         &self,
         Parameters(p): Parameters<RemoveAddressParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ConfigView>, ErrorData> {
-        self.svc.remove_address(&caller_from(&ctx.extensions), p).map(Json).map_err(rpc_error)
+        self.svc
+            .remove_address(&caller_from(&ctx.extensions), p)
+            .map(Json)
+            .map_err(rpc_error)
     }
 
-    #[tool(name = "set_limits", description = "Admins only, when remote settings are on: change invoice limits.")]
+    #[tool(
+        name = "set_limits",
+        description = "Admins only, when remote settings are on: change invoice limits."
+    )]
     async fn set_limits(
         &self,
         Parameters(p): Parameters<SetLimitsParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ConfigView>, ErrorData> {
-        self.svc.set_limits(&caller_from(&ctx.extensions), p).map(Json).map_err(rpc_error)
+        self.svc
+            .set_limits(&caller_from(&ctx.extensions), p)
+            .map(Json)
+            .map_err(rpc_error)
     }
 }
 
@@ -108,7 +157,9 @@ impl ServerHandler for NodeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("deadhop-lnaddr-node", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Lightning invoices for Lightning addresses, for the gateways and admins this node lets in.")
+            .with_instructions(
+                "Lightning invoices for Lightning addresses, for the gateways and admins this node lets in.",
+            )
     }
 }
 
@@ -139,7 +190,10 @@ mod tests {
             (code::BACKEND, -32007),
             (code::INTERNAL, -32603),
         ] {
-            let e = rpc_error(Refusal { code: c, message: "m".into() });
+            let e = rpc_error(Refusal {
+                code: c,
+                message: "m".into(),
+            });
             assert_eq!(e.code.0, n);
             assert_eq!(e.data.unwrap()["code"], c);
         }

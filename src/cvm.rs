@@ -45,6 +45,15 @@ impl std::fmt::Display for CallError {
     }
 }
 
+/// Decode a tool's JSON result. Kept tiny: it is copied for every result type.
+pub fn decode<T: DeserializeOwned>(v: Value) -> Result<T, CallError> {
+    serde_json::from_value(v).map_err(bad)
+}
+
+fn bad(e: serde_json::Error) -> CallError {
+    CallError::Bad(e.to_string())
+}
+
 pub struct NodeClient {
     service: RunningService<RoleClient, ()>,
     pool: Arc<Pool>,
@@ -89,6 +98,11 @@ impl NodeClient {
 
     /// Call `tool` with `args` and decode its structured result.
     pub async fn call<T: DeserializeOwned>(&self, tool: &'static str, args: Value) -> Result<T, CallError> {
+        self.call_value(tool, args).await.and_then(decode)
+    }
+
+    /// Call `tool` and return its structured result as JSON.
+    pub async fn call_value(&self, tool: &'static str, args: Value) -> Result<Value, CallError> {
         let mut params = CallToolRequestParams::new(tool);
         if let Value::Object(map) = args {
             params = params.with_arguments(map);
@@ -96,19 +110,35 @@ impl NodeClient {
         let result = match tokio::time::timeout(self.timeout, self.service.call_tool(params)).await {
             Err(_) => return Err(CallError::Timeout),
             Ok(Err(ServiceError::McpError(e))) => {
-                let code = e.data.as_ref().and_then(|d| d.get("code")).and_then(Value::as_str).unwrap_or("error");
-                return Err(CallError::Refused { code: code.to_string(), message: e.message.to_string() });
+                let code = e
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("error");
+                return Err(CallError::Refused {
+                    code: code.to_string(),
+                    message: e.message.to_string(),
+                });
             }
             Ok(Err(e)) => return Err(CallError::Closed(e.to_string())),
             Ok(Ok(r)) => r,
         };
         if result.is_error == Some(true) {
             // Arguments the tool could not read come back as an error result.
-            let message = result.content.iter().find_map(|c| c.as_text().map(|t| t.text.clone())).unwrap_or_default();
-            return Err(CallError::Refused { code: crate::proto::code::INVALID.into(), message });
+            let message = result
+                .content
+                .iter()
+                .find_map(|c| c.as_text().map(|t| t.text.clone()))
+                .unwrap_or_default();
+            return Err(CallError::Refused {
+                code: crate::proto::code::INVALID.into(),
+                message,
+            });
         }
-        let value = result.structured_content.ok_or(CallError::Bad("no structured content".into()))?;
-        serde_json::from_value(value).map_err(|e| CallError::Bad(e.to_string()))
+        result
+            .structured_content
+            .ok_or(CallError::Bad("no structured content".into()))
     }
 
     pub async fn close(self) {
@@ -125,7 +155,15 @@ mod tests {
     async fn a_closed_client_says_so() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let url = relay.url().await.to_string();
-        let c = NodeClient::connect(Keys::generate(), &Keys::generate().public_key(), &[url], None, Duration::from_secs(2)).await.unwrap();
+        let c = NodeClient::connect(
+            Keys::generate(),
+            &Keys::generate().public_key(),
+            &[url],
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         c.service.cancellation_token().cancel();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let e = c.call::<Value>("anything", Value::Null).await.unwrap_err();
@@ -134,7 +172,10 @@ mod tests {
 
     #[test]
     fn errors_read_well() {
-        let r = CallError::Refused { code: "not_found".into(), message: "no address".into() };
+        let r = CallError::Refused {
+            code: "not_found".into(),
+            message: "no address".into(),
+        };
         assert_eq!(r.to_string(), "no address (not_found)");
         assert!(CallError::Timeout.to_string().contains("in time"));
         assert!(CallError::Closed("x".into()).to_string().contains("gone: x"));

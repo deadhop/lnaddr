@@ -37,7 +37,10 @@ impl Public {
         let l = &cfg.limits;
         Public {
             // Parameters come from the cache, so they get a larger budget.
-            params_limit: RateLimiter::new(l.global_per_minute.saturating_mul(4), l.per_ip_per_minute.saturating_mul(4)),
+            params_limit: RateLimiter::new(
+                l.global_per_minute.saturating_mul(4),
+                l.per_ip_per_minute.saturating_mul(4),
+            ),
             invoice_limit: RateLimiter::new(l.global_per_minute, l.per_ip_per_minute),
             cfg,
             dir,
@@ -55,7 +58,11 @@ impl Public {
         let host = forwarded.or_else(|| headers.get(header::HOST))?.to_str().ok()?;
         let host = host.split(',').next()?.trim().to_ascii_lowercase();
         let host = host.strip_suffix(".").unwrap_or(&host).to_string();
-        self.cfg.domains.iter().find(|d| **d == host || d.split(':').next() == Some(host.as_str())).cloned()
+        self.cfg
+            .domains
+            .iter()
+            .find(|d| **d == host || d.split(':').next() == Some(host.as_str()))
+            .cloned()
     }
 
     fn trusted(&self, peer: Peer) -> bool {
@@ -78,7 +85,10 @@ impl Public {
             .flat_map(|v| v.split(','))
             .filter_map(|s| s.trim().parse().ok())
             .collect();
-        let client = forwarded.iter().rev().find(|ip| !self.cfg.trusted_proxies.iter().any(|n| n.contains(**ip)));
+        let client = forwarded
+            .iter()
+            .rev()
+            .find(|ip| !self.cfg.trusted_proxies.iter().any(|n| n.contains(**ip)));
         match (client, peer.0) {
             (Some(ip), _) => ip.to_string(),
             (None, Some(ip)) => ip.to_string(),
@@ -88,7 +98,11 @@ impl Public {
 }
 
 fn reply(status: u16, body: String, cache: &'static str) -> Response {
-    let mut r = (StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), body).into_response();
+    let mut r = (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        body,
+    )
+        .into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
@@ -110,9 +124,18 @@ pub fn normalise(raw: &str) -> Option<String> {
     lnurl::valid_name(&name).then_some(name)
 }
 
-async fn pay_params(State(p): State<Arc<Public>>, Path(raw): Path<String>, Extension(peer): Extension<Peer>, headers: HeaderMap) -> Response {
-    let Some(name) = normalise(&raw) else { return error(Fail::NotFound) };
-    let Some(domain) = p.domain(&headers, p.trusted(peer)) else { return error(Fail::NotFound) };
+async fn pay_params(
+    State(p): State<Arc<Public>>,
+    Path(raw): Path<String>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(name) = normalise(&raw) else {
+        return error(Fail::NotFound);
+    };
+    let Some(domain) = p.domain(&headers, p.trusted(peer)) else {
+        return error(Fail::NotFound);
+    };
     if !p.params_limit.allow(&p.client_ip(peer, &headers), crate::unix_now()) {
         return error(Fail::RateLimited);
     }
@@ -126,7 +149,11 @@ async fn pay_params(State(p): State<Arc<Public>>, Path(raw): Path<String>, Exten
                 metadata: lnurl::metadata(&name, &domain, &a.description),
                 comment_allowed: (a.comment_allowed > 0).then_some(a.comment_allowed),
             };
-            reply(200, serde_json::to_string(&body).expect("pay parameters always serialise"), "public, max-age=60")
+            reply(
+                200,
+                serde_json::to_string(&body).expect("pay parameters always serialise"),
+                "public, max-age=60",
+            )
         }
         Err(f) => error(f),
     }
@@ -140,8 +167,12 @@ async fn callback(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let Some(name) = normalise(&raw) else { return error(Fail::NotFound) };
-    let Some(domain) = p.domain(&headers, p.trusted(peer)) else { return error(Fail::NotFound) };
+    let Some(name) = normalise(&raw) else {
+        return error(Fail::NotFound);
+    };
+    let Some(domain) = p.domain(&headers, p.trusted(peer)) else {
+        return error(Fail::NotFound);
+    };
     if uri.query().is_some_and(|q| q.len() > 4096) {
         return error(Fail::Invalid("the request is too long".into()));
     }
@@ -155,7 +186,11 @@ async fn callback(
     match p.dir.invoice(&name, &domain, amount, comment).await {
         Ok(pr) => {
             let body = InvoiceResponse { pr, routes: vec![] };
-            reply(200, serde_json::to_string(&body).expect("an invoice always serialises"), "no-store")
+            reply(
+                200,
+                serde_json::to_string(&body).expect("an invoice always serialises"),
+                "no-store",
+            )
         }
         Err(f) => error(f),
     }
@@ -172,7 +207,8 @@ async fn healthz(State(p): State<Arc<Public>>) -> Response {
 
 async fn preflight() -> Response {
     let mut r = reply(204, String::new(), "no-store");
-    r.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET"));
+    r.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET"));
     r
 }
 

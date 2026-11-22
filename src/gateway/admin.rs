@@ -36,8 +36,14 @@ const MARK: &str = include_str!("../../../brand/logo/mark-currentcolor.svg");
 const FAVICON: &str = include_str!("../../../brand/icons/favicon.svg");
 const FONTS: [(&str, &[u8]); 3] = [
     ("geist.woff2", include_bytes!("../../../brand/fonts/geist.woff2")),
-    ("martian-mono.woff2", include_bytes!("../../../brand/fonts/martian-mono.woff2")),
-    ("schibsted-grotesk.woff2", include_bytes!("../../../brand/fonts/schibsted-grotesk.woff2")),
+    (
+        "martian-mono.woff2",
+        include_bytes!("../../../brand/fonts/martian-mono.woff2"),
+    ),
+    (
+        "schibsted-grotesk.woff2",
+        include_bytes!("../../../brand/fonts/schibsted-grotesk.woff2"),
+    ),
 ];
 
 struct Session {
@@ -95,12 +101,12 @@ fn sats(msat: u64) -> String {
     let digits = s.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
     }
-    if msat % 1000 != 0 {
+    if !msat.is_multiple_of(1000) {
         out.push_str(&format!(".{:03}", msat % 1000));
     }
     out
@@ -130,15 +136,22 @@ fn secure_headers(r: &mut Response) {
 
 fn html(status: StatusCode, body: String) -> Response {
     let mut r = (status, body).into_response();
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     secure_headers(&mut r);
     r
 }
 
 fn redirect(to: &str) -> Response {
     let mut r = (StatusCode::SEE_OTHER, "").into_response();
-    r.headers_mut().insert(header::LOCATION, HeaderValue::from_str(to).expect("redirect targets are plain paths"));
+    r.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(to).expect("redirect targets are plain paths"),
+    );
     secure_headers(&mut r);
     r
 }
@@ -207,9 +220,14 @@ pub struct NodeQuery {
 impl Admin {
     pub fn new(cfg: Config, dir: Arc<Directory>, token: String, admin_keys: Option<nostr_sdk::Keys>) -> Self {
         use nostr_sdk::ToBech32;
-        let admin_npub = admin_keys.as_ref().map(|k| k.public_key().to_bech32().expect("keys encode"));
+        let admin_npub = admin_keys
+            .as_ref()
+            .map(|k| k.public_key().to_bech32().expect("keys encode"));
         let links = admin_keys.map(|k| {
-            cfg.nodes.iter().map(|n| NodeLink::new(n.clone(), k.clone(), cfg.socks5, cfg.limits.timeout)).collect()
+            cfg.nodes
+                .iter()
+                .map(|n| NodeLink::new(n.clone(), k.clone(), cfg.socks5, cfg.limits.timeout))
+                .collect()
         });
         Admin {
             cfg,
@@ -241,28 +259,39 @@ impl Admin {
     }
 
     /// A form post must come from this site and carry the session's token.
-    fn check_post(&self, headers: &HeaderMap, csrf: &str) -> Result<(), Response> {
-        let Some(expected) = self.session(headers) else { return Err(redirect("/login")) };
+    fn check_post(&self, headers: &HeaderMap, csrf: &str) -> Result<(), Box<Response>> {
+        let Some(expected) = self.session(headers) else {
+            return Err(Box::new(redirect("/login")));
+        };
         let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
         let cross = headers
             .get(header::ORIGIN)
             .and_then(|o| o.to_str().ok())
             .is_some_and(|o| o.split("://").nth(1) != Some(host));
         if cross || !same(csrf, &expected) {
-            return Err(html(StatusCode::FORBIDDEN, layout("Refused", None, "<h1>Refused.</h1><p class=\"lead\">The form did not come from this page. Reload and try again.</p>")));
+            return Err(Box::new(html(StatusCode::FORBIDDEN, layout("Refused", None, "<h1>Refused.</h1><p class=\"lead\">The form did not come from this page. Reload and try again.</p>"))));
         }
         Ok(())
     }
 
     fn login_page(&self, message: Option<&str>) -> Response {
-        let note = message.map(|m| format!("<div class=\"note bad\">{}</div>", esc(m))).unwrap_or_default();
+        let note = message
+            .map(|m| format!("<div class=\"note bad\">{}</div>", esc(m)))
+            .unwrap_or_default();
         let body = format!(
             "<div class=\"login\"><h1>Sign in.</h1><p class=\"lead\">The token is in <code>{TOKEN_FILE}</code> in the gateway's data directory, or run <code>lnaddr-gateway admin-token</code>.</p>{note}\
 <div class=\"card\"><form method=\"post\" action=\"/login\"><label class=\"lbl\">Admin token<input name=\"token\" type=\"password\" autocomplete=\"current-password\" required></label>\
 <p><button>Sign in</button></p></form></div></div>",
             TOKEN_FILE = crate::gateway::config::TOKEN_FILE
         );
-        html(if message.is_some() { StatusCode::UNAUTHORIZED } else { StatusCode::OK }, layout("Sign in", None, &body))
+        html(
+            if message.is_some() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::OK
+            },
+            layout("Sign in", None, &body),
+        )
     }
 
     async fn overview(&self) -> String {
@@ -310,7 +339,13 @@ impl Admin {
             let rows: String = m
                 .recent_failures
                 .iter()
-                .map(|(t, w)| format!("<tr><td class=\"mono\">{}</td><td>{}</td></tr>", ago(Some(crate::unix_now().saturating_sub(*t))), esc(w)))
+                .map(|(t, w)| {
+                    format!(
+                        "<tr><td class=\"mono\">{}</td><td>{}</td></tr>",
+                        ago(Some(crate::unix_now().saturating_sub(*t))),
+                        esc(w)
+                    )
+                })
                 .collect();
             format!("<table><tr><th>When</th><th>What</th></tr>{rows}</table>")
         };
@@ -334,7 +369,12 @@ impl Admin {
     }
 
     async fn node_page(&self, i: usize, csrf: &str, q: &NodeQuery, message: Option<(&str, String)>) -> Response {
-        let Some(n) = self.dir.nodes.get(i) else { return html(StatusCode::NOT_FOUND, layout("Not found", Some("/"), "<h1>No such node.</h1>")) };
+        let Some(n) = self.dir.nodes.get(i) else {
+            return html(
+                StatusCode::NOT_FOUND,
+                layout("Not found", Some("/"), "<h1>No such node.</h1>"),
+            );
+        };
         let h = n.health().await;
         let mut body = format!(
             "<h1>Node</h1><p class=\"lead mono\">{}</p><div class=\"tiles\"><div class=\"tile\"><div class=\"lbl\">Reachable</div><div class=\"v\">{}</div></div>\
@@ -357,7 +397,10 @@ impl Admin {
             return html(StatusCode::OK, layout("Node", Some("/nodes"), &body));
         };
         let link = &links[i];
-        let (status, view) = tokio::join!(link.call::<Status>(proto::GET_STATUS, json!({})), link.call::<ConfigView>(proto::GET_CONFIG, json!({})));
+        let (status, view) = tokio::join!(
+            link.call::<Status>(proto::GET_STATUS, json!({})),
+            link.call::<ConfigView>(proto::GET_CONFIG, json!({}))
+        );
         match (status, view) {
             (Ok(st), Ok(view)) => {
                 body.push_str(&format!(
@@ -375,7 +418,10 @@ impl Admin {
                 let editable = view.sources.remote.then_some(csrf);
                 body.push_str(&self.address_table(view.addresses.clone(), editable, i));
                 if let Some(csrf) = editable {
-                    let edit = q.edit.as_deref().and_then(|name| view.addresses.iter().find(|a| a.name == name));
+                    let edit = q
+                        .edit
+                        .as_deref()
+                        .and_then(|name| view.addresses.iter().find(|a| a.name == name));
                     body.push_str(&address_form(i, csrf, edit));
                     body.push_str(&limits_form(i, csrf, &view));
                 } else {
@@ -392,7 +438,11 @@ impl Admin {
                     ),
                     other => format!("The node did not answer: {other}"),
                 };
-                body.push_str(&format!("<div class=\"note bad\">{}</div>{}", esc(&why), self.address_table(n.addresses(), None, i)));
+                body.push_str(&format!(
+                    "<div class=\"note bad\">{}</div>{}",
+                    esc(&why),
+                    self.address_table(n.addresses(), None, i)
+                ));
             }
         }
         html(StatusCode::OK, layout("Node", Some("/nodes"), &body))
@@ -426,7 +476,9 @@ impl Admin {
 
     /// Call an admin tool on node `i`, then refresh the public cache.
     async fn change(&self, i: usize, tool: &'static str, args: serde_json::Value) -> Result<(), String> {
-        let Some(link) = self.links.as_ref().and_then(|l| l.get(i)) else { return Err("this gateway has no admin key".into()) };
+        let Some(link) = self.links.as_ref().and_then(|l| l.get(i)) else {
+            return Err("this gateway has no admin key".into());
+        };
         link.call::<ConfigView>(tool, args).await.map_err(|e| e.to_string())?;
         let _ = self.dir.nodes[i].refresh().await;
         Ok(())
@@ -450,7 +502,15 @@ fn address_form(i: usize, csrf: &str, edit: Option<&proto::AddressInfo>) -> Stri
             a.domains.join(", "),
             format!("Edit {}", a.name),
         ),
-        None => (String::new(), "1".into(), "1000000".into(), String::new(), "0".into(), String::new(), "Add an address".into()),
+        None => (
+            String::new(),
+            "1".into(),
+            "1000000".into(),
+            String::new(),
+            "0".into(),
+            String::new(),
+            "Add an address".into(),
+        ),
     };
     format!(
         "<h2>{title}</h2><div class=\"card\"><form class=\"grid\" method=\"post\" action=\"/nodes/{i}/address\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
@@ -483,14 +543,21 @@ fn limits_form(i: usize, csrf: &str, v: &ConfigView) -> String {
 }
 
 fn number(field: &str, s: &str) -> Result<u64, String> {
-    s.trim().replace([',', '_'], "").parse().map_err(|_| format!("{field}: {s:?} is not a whole number"))
+    s.trim()
+        .replace([',', '_'], "")
+        .parse()
+        .map_err(|_| format!("{field}: {s:?} is not a whole number"))
 }
 
 impl AddressForm {
     fn args(&self) -> Result<serde_json::Value, String> {
         let min = number("Min sats", &self.min_sats)?;
         let max = number("Max sats", &self.max_sats)?;
-        let comments = if self.comment_allowed.trim().is_empty() { 0 } else { number("Comment chars", &self.comment_allowed)? };
+        let comments = if self.comment_allowed.trim().is_empty() {
+            0
+        } else {
+            number("Comment chars", &self.comment_allowed)?
+        };
         let domains = crate::settings::list(&self.domains);
         Ok(json!({
             "name": self.name.trim(),
@@ -537,31 +604,55 @@ async fn post_login(State(a): St, Extension(peer): Extension<Peer>, Form(f): For
         let now = Instant::now();
         s.retain(|_, v| v.expires > now);
         if s.len() >= MAX_SESSIONS {
-            let oldest = s.iter().min_by_key(|(_, v)| v.expires).map(|(k, _)| k.clone()).expect("the map is full");
+            let oldest = s
+                .iter()
+                .min_by_key(|(_, v)| v.expires)
+                .map(|(k, _)| k.clone())
+                .expect("the map is full");
             s.remove(&oldest);
         }
-        s.insert(id.clone(), Session { csrf: random_hex(), expires: now + SESSION_TTL });
+        s.insert(
+            id.clone(),
+            Session {
+                csrf: random_hex(),
+                expires: now + SESSION_TTL,
+            },
+        );
     }
     let secure = if a.cfg.secure_cookie { "; Secure" } else { "" };
     let mut r = redirect("/");
-    let cookie = format!("{COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{secure}", SESSION_TTL.as_secs());
-    r.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie is ASCII"));
+    let cookie = format!(
+        "{COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{secure}",
+        SESSION_TTL.as_secs()
+    );
+    r.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("cookie is ASCII"),
+    );
     r
 }
 
 /// The session id in the request's cookies.
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|c| {
-        let (k, v) = c.trim().split_once('=')?;
-        (k == COOKIE).then(|| v.to_string())
-    })
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|c| {
+            let (k, v) = c.trim().split_once('=')?;
+            (k == COOKIE).then(|| v.to_string())
+        })
 }
 
 async fn post_logout(State(a): St, headers: HeaderMap) -> Response {
     let id = session_cookie(&headers).unwrap_or_default();
     a.sessions().remove(&id);
     let mut r = redirect("/login");
-    r.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("lnaddr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"));
+    r.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("lnaddr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+    );
     r
 }
 
@@ -574,20 +665,25 @@ async fn get_overview(State(a): St, headers: HeaderMap) -> Response {
 }
 
 async fn get_node(State(a): St, Path(i): Path<usize>, Query(q): Query<NodeQuery>, headers: HeaderMap) -> Response {
-    let Some(csrf) = a.session(&headers) else { return redirect("/login") };
+    let Some(csrf) = a.session(&headers) else {
+        return redirect("/login");
+    };
     a.node_page(i, &csrf, &q, None).await
 }
 
 async fn finish(a: &Admin, i: usize, csrf: &str, outcome: Result<(), String>) -> Response {
     match outcome {
         Ok(()) => redirect(&format!("/nodes/{i}?saved=1")),
-        Err(e) => a.node_page(i, csrf, &NodeQuery::default(), Some(("bad", format!("Not saved. {e}")))).await,
+        Err(e) => {
+            a.node_page(i, csrf, &NodeQuery::default(), Some(("bad", format!("Not saved. {e}"))))
+                .await
+        }
     }
 }
 
 async fn post_address(State(a): St, Path(i): Path<usize>, headers: HeaderMap, Form(f): Form<AddressForm>) -> Response {
     if let Err(r) = a.check_post(&headers, &f.csrf) {
-        return r;
+        return *r;
     }
     let outcome = match f.args() {
         Ok(args) => a.change(i, proto::SET_ADDRESS, args).await,
@@ -598,7 +694,7 @@ async fn post_address(State(a): St, Path(i): Path<usize>, headers: HeaderMap, Fo
 
 async fn post_remove(State(a): St, Path(i): Path<usize>, headers: HeaderMap, Form(f): Form<RemoveForm>) -> Response {
     if let Err(r) = a.check_post(&headers, &f.csrf) {
-        return r;
+        return *r;
     }
     let outcome = a.change(i, proto::REMOVE_ADDRESS, json!({ "name": f.name })).await;
     finish(&a, i, &f.csrf, outcome).await
@@ -606,7 +702,7 @@ async fn post_remove(State(a): St, Path(i): Path<usize>, headers: HeaderMap, For
 
 async fn post_limits(State(a): St, Path(i): Path<usize>, headers: HeaderMap, Form(f): Form<LimitsForm>) -> Response {
     if let Err(r) = a.check_post(&headers, &f.csrf) {
-        return r;
+        return *r;
     }
     let outcome = match f.args() {
         Ok(args) => a.change(i, proto::SET_LIMITS, args).await,
@@ -625,14 +721,23 @@ async fn asset(Path(file): Path<String>) -> Response {
         },
     };
     let mut r = (StatusCode::OK, body).into_response();
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
     secure_headers(&mut r);
     r
 }
 
 async fn not_found() -> Response {
-    html(StatusCode::NOT_FOUND, layout("Not found", None, "<h1>Not found.</h1><p class=\"lead\"><a href=\"/\">Back to the overview</a></p>"))
+    html(
+        StatusCode::NOT_FOUND,
+        layout(
+            "Not found",
+            None,
+            "<h1>Not found.</h1><p class=\"lead\"><a href=\"/\">Back to the overview</a></p>",
+        ),
+    )
 }
 
 pub fn router(a: Arc<Admin>) -> Router {
@@ -655,25 +760,44 @@ mod tests {
     use crate::gateway::config::NodeConfig;
 
     fn admin() -> Admin {
-        let node = NodeConfig { pubkey: nostr_sdk::Keys::generate().public_key(), names: None, relays: vec!["ws://127.0.0.1:9".into()], payee: None };
+        let node = NodeConfig {
+            pubkey: nostr_sdk::Keys::generate().public_key(),
+            names: None,
+            relays: vec!["ws://127.0.0.1:9".into()],
+            payee: None,
+        };
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::gateway::tests::gateway_config_for(vec![node], dir.path());
         cfg.limits.timeout = Duration::from_secs(1);
-        let d = Arc::new(Directory::new(cfg.nodes.clone(), nostr_sdk::Keys::generate(), None, cfg.limits.timeout));
+        let d = Arc::new(Directory::new(
+            cfg.nodes.clone(),
+            nostr_sdk::Keys::generate(),
+            None,
+            cfg.limits.timeout,
+        ));
         Admin::new(cfg, d, "t".into(), None)
     }
 
     fn with_cookie(id: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, HeaderValue::from_str(&format!("{COOKIE}={id}")).unwrap());
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{COOKIE}={id}")).unwrap(),
+        );
         h
     }
 
     #[test]
     fn text_is_escaped_and_numbers_read_well() {
-        assert_eq!(esc("<a href=\"x\">&'</a>"), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;");
+        assert_eq!(
+            esc("<a href=\"x\">&'</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;"
+        );
         assert_eq!(short("npub1abc"), "npub1abc");
-        assert_eq!(short(&format!("npub1{}", "q".repeat(58))), format!("npub1qqqqqqq…{}", "q".repeat(6)));
+        assert_eq!(
+            short(&format!("npub1{}", "q".repeat(58))),
+            format!("npub1qqqqqqq…{}", "q".repeat(6))
+        );
         assert_eq!(sats(1_234_567_000), "1,234,567");
         assert_eq!(sats(1_500), "1.500");
         assert_eq!(ago(None), "never");
@@ -686,18 +810,34 @@ mod tests {
     #[test]
     fn sessions_expire_and_the_oldest_gives_way() {
         let a = admin();
-        a.sessions().insert("old".into(), Session { csrf: "c".into(), expires: Instant::now() - Duration::from_secs(1) });
+        a.sessions().insert(
+            "old".into(),
+            Session {
+                csrf: "c".into(),
+                expires: Instant::now() - Duration::from_secs(1),
+            },
+        );
         assert_eq!(a.session(&with_cookie("old")), None);
         assert!(a.sessions().is_empty(), "an expired session is forgotten");
         assert_eq!(a.session(&with_cookie("unknown")), None);
         assert_eq!(a.session(&HeaderMap::new()), None);
         let now = Instant::now() + Duration::from_secs(60);
         for i in 0..MAX_SESSIONS {
-            a.sessions().insert(format!("s{i}"), Session { csrf: "c".into(), expires: now + Duration::from_secs(i as u64) });
+            a.sessions().insert(
+                format!("s{i}"),
+                Session {
+                    csrf: "c".into(),
+                    expires: now + Duration::from_secs(i as u64),
+                },
+            );
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
         let a = Arc::new(a);
-        let r = rt.block_on(post_login(State(a.clone()), Extension(Peer(None)), Form(LoginForm { token: "t".into() })));
+        let r = rt.block_on(post_login(
+            State(a.clone()),
+            Extension(Peer(None)),
+            Form(LoginForm { token: "t".into() }),
+        ));
         assert_eq!(r.status(), StatusCode::SEE_OTHER);
         let s = a.sessions();
         assert_eq!(s.len(), MAX_SESSIONS);
@@ -710,6 +850,10 @@ mod tests {
         let page = a.overview().await;
         assert!(page.contains("dot wait") && page.contains("No addresses yet"), "{page}");
         assert!(a.address_table(vec![], None, 0).contains("None."));
-        assert!(a.change(0, proto::SET_LIMITS, json!({})).await.unwrap_err().contains("no admin key"));
+        assert!(a
+            .change(0, proto::SET_LIMITS, json!({}))
+            .await
+            .unwrap_err()
+            .contains("no admin key"));
     }
 }

@@ -1,7 +1,6 @@
 //! Running the node: its Nostr identity, the ContextVM server, and the
 //! `lnaddr-node` command line.
 
-use std::future::Future;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -61,7 +60,13 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
             Ok::<String, String>(format!("{:?}", running.waiting().await))
         }
     });
-    Ok(Running { keys, svc, pool, cancel, task })
+    Ok(Running {
+        keys,
+        svc,
+        pool,
+        cancel,
+        task,
+    })
 }
 
 impl Running {
@@ -70,7 +75,7 @@ impl Running {
     }
 
     /// Serve until `shutdown`; an error if the request loop ended first.
-    pub async fn until(mut self, shutdown: impl Future<Output = ()>) -> Result<(), String> {
+    pub async fn until(mut self, shutdown: crate::Shutdown) -> Result<(), String> {
         let outcome = tokio::select! {
             _ = shutdown => Ok(()),
             why = &mut self.task => Err(format!("the request loop ended: {}", match why { Ok(Ok(s) | Err(s)) => s, Err(e) => e.to_string() })),
@@ -97,7 +102,12 @@ options:
 pub const DEFAULT_LOG: &str = "warn,deadhop_lnaddr=info,contextvm_sdk=off,rmcp=off";
 
 pub fn log_filter(value: Option<String>) -> String {
-    value.filter(|v| !v.trim().is_empty()).unwrap_or_else(|| DEFAULT_LOG.into())
+    log_filter_or(value, DEFAULT_LOG)
+}
+
+/// `value`, or `default` when it is unset or blank.
+pub fn log_filter_or(value: Option<String>, default: &str) -> String {
+    value.filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.into())
 }
 
 /// Split `--config FILE` out of the arguments.
@@ -120,14 +130,27 @@ pub fn split_config(args: &[String]) -> Result<(Vec<String>, Option<String>), St
 fn print_check(cfg: &Config, out: &mut dyn Write) {
     let b = &cfg.backend;
     let _ = writeln!(out, "configuration");
-    let _ = writeln!(out, "  sources    file={} env={} remote={}", cfg.sources.file, cfg.sources.env, cfg.sources.remote);
+    let _ = writeln!(
+        out,
+        "  sources    file={} env={} remote={}",
+        cfg.sources.file, cfg.sources.env, cfg.sources.remote
+    );
     let _ = writeln!(out, "  data dir   {}", cfg.data_dir.display());
     let _ = writeln!(out, "  relays     {}", cfg.relays.join(", "));
     let _ = writeln!(out, "  gateways   {}", cfg.gateways.len());
     let _ = writeln!(out, "  admins     {}", cfg.admins.len());
     let _ = writeln!(out, "  network    {:?}", cfg.network);
-    let pin = b.pin.map(|p| format!(", pinned {}…", &hex::encode(p)[..16])).unwrap_or_default();
-    let _ = writeln!(out, "  backend    {} at {}{pin}, credential {}", b.kind.name(), b.url, crate::settings::redact(true));
+    let pin = b
+        .pin
+        .map(|p| format!(", pinned {}…", &hex::encode(p)[..16]))
+        .unwrap_or_default();
+    let _ = writeln!(
+        out,
+        "  backend    {} at {}{pin}, credential {}",
+        b.kind.name(),
+        b.url,
+        crate::settings::redact(true)
+    );
     for (name, a) in &cfg.addresses {
         let _ = writeln!(
             out,
@@ -150,11 +173,25 @@ pub async fn check(cfg: &Config, out: &mut dyn Write) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let caller = crate::node::service::Caller { pubkey: cfg.gateways.first().or(cfg.admins.first()).map(|k| k.to_hex()), event: None };
-    let p = crate::proto::MakeInvoiceParams { name: probe.0.clone(), domain: "check.invalid".into(), amount_msat: probe.1, comment: None };
+    let caller = crate::node::service::Caller {
+        pubkey: cfg.gateways.first().or(cfg.admins.first()).map(|k| k.to_hex()),
+        event: None,
+    };
+    let p = crate::proto::MakeInvoiceParams {
+        name: probe.0.clone(),
+        domain: "check.invalid".into(),
+        amount_msat: probe.1,
+        comment: None,
+    };
     match svc.make_invoice(&caller, p).await {
         Ok(made) => {
-            let _ = writeln!(out, "backend    ok: made a {} sat test invoice for {} ({}…)", probe.1 / 1000, probe.0, &made.pr[..24]);
+            let _ = writeln!(
+                out,
+                "backend    ok: made a {} sat test invoice for {} ({}…)",
+                probe.1 / 1000,
+                probe.0,
+                &made.pr[..24]
+            );
             ExitCode::SUCCESS
         }
         Err(r) => {
@@ -166,7 +203,7 @@ pub async fn check(cfg: &Config, out: &mut dyn Write) -> ExitCode {
 }
 
 /// Start with `cfg` and serve until `shutdown`.
-pub async fn serve(cfg: Result<Config, String>, shutdown: impl Future<Output = ()>) -> Result<(), String> {
+pub async fn serve(cfg: Result<Config, String>, shutdown: crate::Shutdown) -> Result<(), String> {
     let running = start(cfg?).await?;
     let npub = running.keys.public_key().to_bech32().expect("keys encode");
     tracing::info!(%npub, "lnaddr node is serving");
@@ -176,12 +213,14 @@ pub async fn serve(cfg: Result<Config, String>, shutdown: impl Future<Output = (
 /// What the binary runs.
 pub async fn command(
     args: &[String],
-    lookup: impl Fn(&str) -> Option<String>,
-    shutdown: impl Future<Output = ()>,
+    lookup: crate::Lookup,
+    shutdown: crate::Shutdown,
     out: &mut dyn Write,
 ) -> ExitCode {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter(lookup("LNADDR_NODE_LOG"))))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter(lookup(
+            "LNADDR_NODE_LOG",
+        ))))
         .with_writer(std::io::stderr)
         .try_init();
     let (args, file) = match split_config(args) {
@@ -207,7 +246,8 @@ pub async fn command(
         }
         "pubkey" => {
             let dir = config::data_dir_only(config::BUILTIN, &lookup);
-            let made = crate::files::open_dir(&dir).and_then(|()| crate::files::load_or_create_keys(&dir.join(KEY_FILE)));
+            let made =
+                crate::files::open_dir(&dir).and_then(|()| crate::files::load_or_create_keys(&dir.join(KEY_FILE)));
             match made {
                 Ok(keys) => {
                     let _ = writeln!(out, "{}", keys.public_key().to_bech32().expect("keys encode"));
@@ -266,11 +306,25 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = test_config(&url, kind, &dir.path().join("data"));
         cfg.relays = vec![relay_url.clone()];
-        NodeRig { relay, relay_url, fake, dir, cfg }
+        NodeRig {
+            relay,
+            relay_url,
+            fake,
+            dir,
+            cfg,
+        }
     }
 
     pub async fn client(r: &NodeRig, keys: Keys, node: &Keys, timeout: Duration) -> NodeClient {
-        NodeClient::connect(keys, &node.public_key(), &[r.relay_url.clone()], None, timeout).await.unwrap()
+        NodeClient::connect(
+            keys,
+            &node.public_key(),
+            std::slice::from_ref(&r.relay_url),
+            None,
+            timeout,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -282,16 +336,28 @@ pub mod tests {
         let list: AddressList = gw.call(proto::LIST_ADDRESSES, json!({})).await.unwrap();
         assert_eq!(list.addresses.len(), 2);
         let made: MadeInvoice = gw
-            .call(proto::MAKE_INVOICE, json!({ "name": "alice", "domain": "pay.example", "amount_msat": 5000 }))
+            .call(
+                proto::MAKE_INVOICE,
+                json!({ "name": "alice", "domain": "pay.example", "amount_msat": 5000 }),
+            )
             .await
             .unwrap();
         assert!(made.pr.starts_with("lnbcrt"));
         let refused = gw.call::<Status>(proto::GET_STATUS, json!({})).await.unwrap_err();
-        assert!(matches!(refused, CallError::Refused { ref code, .. } if code == "unauthorized"), "{refused:?}");
-        let bad = gw.call::<MadeInvoice>(proto::MAKE_INVOICE, json!({ "name": "alice" })).await.unwrap_err();
+        assert!(
+            matches!(refused, CallError::Refused { ref code, .. } if code == "unauthorized"),
+            "{refused:?}"
+        );
+        let bad = gw
+            .call::<MadeInvoice>(proto::MAKE_INVOICE, json!({ "name": "alice" }))
+            .await
+            .unwrap_err();
         assert!(matches!(bad, CallError::Refused { .. }), "{bad:?}");
         // A tool answering with something else than promised is reported.
-        let wrong = gw.call::<MadeInvoice>(proto::LIST_ADDRESSES, json!(null)).await.unwrap_err();
+        let wrong = gw
+            .call::<MadeInvoice>(proto::LIST_ADDRESSES, json!(null))
+            .await
+            .unwrap_err();
         assert!(matches!(wrong, CallError::Bad(_)), "{wrong:?}");
         assert!(gw.relays_connected().await >= 1);
 
@@ -299,22 +365,37 @@ pub mod tests {
         let st: Status = admin.call(proto::GET_STATUS, json!({})).await.unwrap();
         assert_eq!(st.invoices_made, 1);
         let view: ConfigView = admin
-            .call(proto::SET_ADDRESS, json!({ "name": "dave", "min_sendable": 1000, "max_sendable": 2000, "description": "Dave" }))
+            .call(
+                proto::SET_ADDRESS,
+                json!({ "name": "dave", "min_sendable": 1000, "max_sendable": 2000, "description": "Dave" }),
+            )
             .await
             .unwrap();
         assert_eq!(view.addresses.len(), 3);
-        let _: ConfigView = admin.call(proto::REMOVE_ADDRESS, json!({ "name": "dave" })).await.unwrap();
-        let _: ConfigView = admin.call(proto::SET_LIMITS, json!({ "invoices_per_minute": 50 })).await.unwrap();
+        let _: ConfigView = admin
+            .call(proto::REMOVE_ADDRESS, json!({ "name": "dave" }))
+            .await
+            .unwrap();
+        let _: ConfigView = admin
+            .call(proto::SET_LIMITS, json!({ "invoices_per_minute": 50 }))
+            .await
+            .unwrap();
         let _: ConfigView = admin.call(proto::GET_CONFIG, json!({})).await.unwrap();
 
         // A key the node does not list gets no answer at all.
         let stranger = client(&r, Keys::generate(), &key, Duration::from_secs(2)).await;
-        assert_eq!(stranger.call::<AddressList>(proto::LIST_ADDRESSES, json!({})).await.unwrap_err(), CallError::Timeout);
+        assert_eq!(
+            stranger
+                .call::<AddressList>(proto::LIST_ADDRESSES, json!({}))
+                .await
+                .unwrap_err(),
+            CallError::Timeout
+        );
         stranger.close().await;
         gw.close().await;
         admin.close().await;
         assert!(node.relays_connected().await >= 1);
-        node.until(async {}).await.unwrap();
+        node.until(Box::pin(async {})).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -324,16 +405,22 @@ pub mod tests {
         let key = node.keys.clone();
         let gw = client(&r, gateway_keys(), &key, Duration::from_secs(10)).await;
         let _: AddressList = gw.call(proto::LIST_ADDRESSES, json!({})).await.unwrap();
-        node.until(async {}).await.unwrap();
+        node.until(Box::pin(async {})).await.unwrap();
         // While it is down, calls time out instead of hanging.
         let short = client(&r, gateway_keys(), &key, Duration::from_secs(1)).await;
-        assert_eq!(short.call::<AddressList>(proto::LIST_ADDRESSES, json!({})).await.unwrap_err(), CallError::Timeout);
+        assert_eq!(
+            short
+                .call::<AddressList>(proto::LIST_ADDRESSES, json!({}))
+                .await
+                .unwrap_err(),
+            CallError::Timeout
+        );
         let again = start(r.cfg.clone()).await.unwrap();
         assert_eq!(again.keys.public_key(), key.public_key());
         tokio::time::sleep(Duration::from_millis(500)).await;
         let list: AddressList = gw.call(proto::LIST_ADDRESSES, json!({})).await.unwrap();
         assert_eq!(list.addresses.len(), 2);
-        again.until(async {}).await.unwrap();
+        again.until(Box::pin(async {})).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -346,7 +433,10 @@ pub mod tests {
             ("LNADDR_NODE_GATEWAYS".into(), gateway_keys().public_key().to_hex()),
             ("LNADDR_NODE_BACKEND".into(), "lnd".into()),
             ("LNADDR_NODE_BACKEND_URL".into(), r.cfg.backend.url.clone()),
-            ("LNADDR_NODE_BACKEND_SECRET".into(), crate::node::backend::testutil::SECRET.into()),
+            (
+                "LNADDR_NODE_BACKEND_SECRET".into(),
+                crate::node::backend::testutil::SECRET.into(),
+            ),
             ("LNADDR_NODE_NETWORK".into(), "regtest".into()),
             ("LNADDR_NODE_ADDRESSES".into(), "alice".into()),
         ];
@@ -359,7 +449,7 @@ pub mod tests {
             let lookup = lookup.clone();
             async move {
                 let mut out = Vec::new();
-                let code = command(&args, lookup, async {}, &mut out).await;
+                let code = command(&args, Box::new(lookup), Box::pin(async {}), &mut out).await;
                 (code, String::from_utf8(out).unwrap())
             }
         };
@@ -376,7 +466,10 @@ pub mod tests {
         assert_eq!(run(&["pubkey"]).await.1, out);
         let (code, out) = run(&["check"]).await;
         assert_eq!(code, ExitCode::SUCCESS, "{out}");
-        assert!(out.contains("backend    ok: made a 1 sat test invoice for alice"), "{out}");
+        assert!(
+            out.contains("backend    ok: made a 1 sat test invoice for alice"),
+            "{out}"
+        );
         assert!(out.contains("credential (set)") && !out.contains(crate::node::backend::testutil::SECRET));
         *r.fake.fail.lock().unwrap() = Some((403, "denied".into()));
         let (code, out) = run(&["check"]).await;
@@ -385,7 +478,10 @@ pub mod tests {
         let (code, out) = run(&["serve", "--config=/does/not/exist"]).await;
         assert_eq!(code, ExitCode::FAILURE);
         assert!(out.contains("/does/not/exist"));
-        assert!(run(&["check", "--config", "/does/not/exist"]).await.1.contains("/does/not/exist"));
+        assert!(run(&["check", "--config", "/does/not/exist"])
+            .await
+            .1
+            .contains("/does/not/exist"));
         // serve with an immediate shutdown.
         assert_eq!(run(&[]).await.0, ExitCode::SUCCESS);
     }
@@ -399,9 +495,21 @@ pub mod tests {
         let bad_dir = file.join("data");
         let lookup = move |k: &str| (k == "LNADDR_NODE_DATA_DIR").then(|| bad_dir.display().to_string());
         let mut out = Vec::new();
-        assert_eq!(command(&["pubkey".to_string()], lookup.clone(), std::future::ready(()), &mut out).await, ExitCode::FAILURE);
+        assert_eq!(
+            command(
+                &["pubkey".to_string()],
+                Box::new(lookup.clone()),
+                Box::pin(std::future::ready(())),
+                &mut out
+            )
+            .await,
+            ExitCode::FAILURE
+        );
         let mut out = Vec::new();
-        assert_eq!(command(&[], lookup, std::future::ready(()), &mut out).await, ExitCode::FAILURE);
+        assert_eq!(
+            command(&[], Box::new(lookup), Box::pin(std::future::ready(())), &mut out).await,
+            ExitCode::FAILURE
+        );
         assert!(String::from_utf8(out).unwrap().contains("lnaddr-node:"));
         // A valid configuration whose data directory cannot be made.
         let r = node_rig(Kind::Lnd).await;
@@ -429,7 +537,7 @@ pub mod tests {
         let r = node_rig(Kind::Lnd).await;
         let node = start(r.cfg.clone()).await.unwrap();
         node.cancel.cancel();
-        let e = node.until(std::future::pending()).await.unwrap_err();
+        let e = node.until(Box::pin(std::future::pending())).await.unwrap_err();
         assert!(e.contains("request loop ended"), "{e}");
     }
 
@@ -438,7 +546,7 @@ pub mod tests {
         let r = node_rig(Kind::Lnd).await;
         let node = start(r.cfg.clone()).await.unwrap();
         node.task.abort();
-        let e = node.until(std::future::pending()).await.unwrap_err();
+        let e = node.until(Box::pin(std::future::pending())).await.unwrap_err();
         assert!(e.contains("request loop ended"), "{e}");
     }
 }

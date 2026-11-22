@@ -38,13 +38,18 @@ impl Bound {
 
 pub async fn bind(listen: &Listen) -> Result<Bound, String> {
     match listen {
-        Listen::Tcp(addr) => tokio::net::TcpListener::bind(addr).await.map(Bound::Tcp).map_err(|e| format!("cannot listen on {addr}: {e}")),
+        Listen::Tcp(addr) => tokio::net::TcpListener::bind(addr)
+            .await
+            .map(Bound::Tcp)
+            .map_err(|e| format!("cannot listen on {addr}: {e}")),
         Listen::Unix(path) => {
             // A socket left by an earlier run would block the bind; anything else is kept.
-            if std::fs::symlink_metadata(path).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type())) {
+            if std::fs::symlink_metadata(path).is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
+            {
                 let _ = std::fs::remove_file(path);
             }
-            let l = tokio::net::UnixListener::bind(path).map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
+            let l = tokio::net::UnixListener::bind(path)
+                .map_err(|e| format!("cannot listen on {}: {e}", path.display()))?;
             Ok(Bound::Unix(l, path.clone()))
         }
     }
@@ -53,15 +58,25 @@ pub async fn bind(listen: &Listen) -> Result<Bound, String> {
 /// How long a client may take to send a request's headers.
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn spawn_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: S, peer: Peer, app: Router, permit: tokio::sync::OwnedSemaphorePermit) {
+/// A connection of either kind.
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+fn spawn_conn(io: Box<dyn Io>, peer: Peer, app: Router, permit: tokio::sync::OwnedSemaphorePermit) {
     tokio::spawn(async move {
         let svc = tower::service_fn(move |mut req: axum::http::Request<hyper::body::Incoming>| {
             req.extensions_mut().insert(peer);
             app.clone().oneshot(req.map(axum::body::Body::new))
         });
         let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-        b.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(16 * 1024);
-        let _ = b.http1_only().serve_connection(TokioIo::new(io), TowerToHyperService::new(svc)).await;
+        b.http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(HEADER_TIMEOUT)
+            .max_buf_size(16 * 1024);
+        let _ = b
+            .http1_only()
+            .serve_connection(TokioIo::new(io), TowerToHyperService::new(svc))
+            .await;
         drop(permit);
     });
 }
@@ -74,20 +89,24 @@ pub async fn serve(bound: Bound, app: Router, max_conns: u32, stop: Cancellation
     }
 }
 
-trait Accept {
-    fn accept(&self) -> impl std::future::Future<Output = std::io::Result<Conn>> + Send;
+type Accepting<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Conn>> + Send + 'a>>;
+
+trait Accept: Sync {
+    fn accept(&self) -> Accepting<'_>;
 }
 
 impl Accept for Bound {
-    async fn accept(&self) -> std::io::Result<Conn> {
-        match self {
-            Bound::Tcp(l) => l.accept().await.map(|(s, a)| Conn::Tcp(s, a.ip())),
-            Bound::Unix(l, _) => l.accept().await.map(|(s, _)| Conn::Unix(s)),
-        }
+    fn accept(&self) -> Accepting<'_> {
+        Box::pin(async move {
+            match self {
+                Bound::Tcp(l) => l.accept().await.map(|(s, a)| Conn::Tcp(s, a.ip())),
+                Bound::Unix(l, _) => l.accept().await.map(|(s, _)| Conn::Unix(s)),
+            }
+        })
     }
 }
 
-async fn serve_from(bound: &impl Accept, app: Router, max_conns: u32, stop: CancellationToken) {
+async fn serve_from(bound: &(dyn Accept + Sync), app: Router, max_conns: u32, stop: CancellationToken) {
     let permits = Arc::new(Semaphore::new(max_conns as usize));
     loop {
         let permit = tokio::select! {
@@ -97,8 +116,8 @@ async fn serve_from(bound: &impl Accept, app: Router, max_conns: u32, stop: Canc
         tokio::select! {
             _ = stop.cancelled() => break,
             conn = bound.accept() => match conn {
-                Ok(Conn::Tcp(s, ip)) => spawn_conn(s, Peer(Some(ip)), app.clone(), permit),
-                Ok(Conn::Unix(s)) => spawn_conn(s, Peer(None), app.clone(), permit),
+                Ok(Conn::Tcp(s, ip)) => spawn_conn(Box::new(s), Peer(Some(ip)), app.clone(), permit),
+                Ok(Conn::Unix(s)) => spawn_conn(Box::new(s), Peer(None), app.clone(), permit),
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -121,7 +140,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn app() -> Router {
-        Router::new().route("/", get(|Extension(p): Extension<Peer>| async move { format!("{:?}", p.0) }))
+        Router::new().route(
+            "/",
+            get(|Extension(p): Extension<Peer>| async move { format!("{:?}", p.0) }),
+        )
     }
 
     #[tokio::test]
@@ -130,7 +152,14 @@ mod tests {
         let tcp = bind(&Listen::Tcp("127.0.0.1:0".parse().unwrap())).await.unwrap();
         let Listen::Tcp(addr) = tcp.local() else { unreachable!() };
         tokio::spawn(serve(tcp, app(), 16, stop.clone()));
-        let body = crate::tls::http_client(Duration::from_secs(5)).get(format!("http://{addr}/")).send().await.unwrap().text().await.unwrap();
+        let body = crate::tls::http_client(Duration::from_secs(5))
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         assert_eq!(body, "Some(127.0.0.1)");
 
         let dir = tempfile::tempdir().unwrap();
@@ -141,7 +170,9 @@ mod tests {
         assert_eq!(unix.local(), Listen::Unix(path.clone()));
         let task = tokio::spawn(serve(unix, app(), 16, stop.clone()));
         let mut s = tokio::net::UnixStream::connect(&path).await.unwrap();
-        s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).await.unwrap();
         assert!(out.ends_with("None"), "{out}");
@@ -177,15 +208,19 @@ mod tests {
         // ...until the header timeout drops it.
         drop(idle);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let ok = crate::tls::http_client(Duration::from_secs(5)).get(format!("http://{addr}/")).send().await.unwrap();
+        let ok = crate::tls::http_client(Duration::from_secs(5))
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
         assert!(ok.status().is_success());
         stop.cancel();
     }
 
     struct Broken;
     impl Accept for Broken {
-        async fn accept(&self) -> std::io::Result<Conn> {
-            Err(std::io::Error::other("too many open files"))
+        fn accept(&self) -> Accepting<'_> {
+            Box::pin(async { Err(std::io::Error::other("too many open files")) })
         }
     }
 

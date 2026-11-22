@@ -29,7 +29,10 @@ impl Listen {
         match s.strip_prefix("unix:") {
             Some(path) if !path.is_empty() => Ok(Listen::Unix(PathBuf::from(path))),
             Some(_) => Err("listen: unix: needs a socket path".into()),
-            None => s.parse().map(Listen::Tcp).map_err(|_| format!("listen: {s:?} is not an address and port, e.g. 127.0.0.1:8080")),
+            None => s
+                .parse()
+                .map(Listen::Tcp)
+                .map_err(|_| format!("listen: {s:?} is not an address and port, e.g. 127.0.0.1:8080")),
         }
     }
 
@@ -187,13 +190,28 @@ fn merge(a: &mut Layer, b: Layer) {
     macro_rules! take {
         ($($f:ident),*) => { $( if b.$f.is_some() { a.$f = b.$f; } )* };
     }
-    take!(data_dir, listen, domains, scheme, trusted_proxies, relays, socks5, nodes);
+    take!(
+        data_dir,
+        listen,
+        domains,
+        scheme,
+        trusted_proxies,
+        relays,
+        socks5,
+        nodes
+    );
     if let Some(bl) = b.limits {
         let al = a.limits.get_or_insert_with(Default::default);
         macro_rules! takel {
             ($($f:ident),*) => { $( if bl.$f.is_some() { al.$f = bl.$f; } )* };
         }
-        takel!(per_ip_per_minute, global_per_minute, timeout_secs, cache_secs, max_connections);
+        takel!(
+            per_ip_per_minute,
+            global_per_minute,
+            timeout_secs,
+            cache_secs,
+            max_connections
+        );
     }
     if let Some(ba) = b.admin {
         let aa = a.admin.get_or_insert_with(Default::default);
@@ -211,10 +229,14 @@ fn merge(a: &mut Layer, b: Layer) {
 fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
     let get = |k: &str| lookup(&format!("LNADDR_GATEWAY_{k}")).filter(|v| !v.trim().is_empty());
     let num = |k: &str| -> Result<Option<u64>, String> {
-        get(k).map(|v| settings::number::<u64>(&format!("LNADDR_GATEWAY_{k}"), &v)).transpose()
+        get(k)
+            .map(|v| settings::number::<u64>(&format!("LNADDR_GATEWAY_{k}"), &v))
+            .transpose()
     };
     let n32 = |k: &str| -> Result<Option<u32>, String> {
-        get(k).map(|v| settings::number::<u32>(&format!("LNADDR_GATEWAY_{k}"), &v)).transpose()
+        get(k)
+            .map(|v| settings::number::<u32>(&format!("LNADDR_GATEWAY_{k}"), &v))
+            .transpose()
     };
     let limits = LimitsLayer {
         per_ip_per_minute: n32("PER_IP_PER_MINUTE")?,
@@ -223,9 +245,17 @@ fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
         cache_secs: num("CACHE_SECS")?,
         max_connections: n32("MAX_CONNECTIONS")?,
     };
-    let secure_cookie = get("ADMIN_SECURE_COOKIE").map(|v| settings::flag("LNADDR_GATEWAY_ADMIN_SECURE_COOKIE", &v)).transpose()?;
+    let secure_cookie = get("ADMIN_SECURE_COOKIE")
+        .map(|v| settings::flag("LNADDR_GATEWAY_ADMIN_SECURE_COOKIE", &v))
+        .transpose()?;
     let nodes = get("NODES").or(get("NODE")).map(|v| {
-        settings::list(&v).into_iter().map(|pubkey| NodeLayer { pubkey, ..Default::default() }).collect()
+        settings::list(&v)
+            .into_iter()
+            .map(|pubkey| NodeLayer {
+                pubkey,
+                ..Default::default()
+            })
+            .collect()
     });
     Ok(Layer {
         data_dir: get("DATA_DIR").map(PathBuf::from),
@@ -237,7 +267,10 @@ fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
         socks5: get("SOCKS5"),
         nodes,
         limits: Some(limits),
-        admin: Some(AdminLayer { listen: get("ADMIN_LISTEN"), secure_cookie }),
+        admin: Some(AdminLayer {
+            listen: get("ADMIN_LISTEN"),
+            secure_cookie,
+        }),
         sources: None,
     })
 }
@@ -279,7 +312,10 @@ fn default_data_dir(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
 
 /// Just the data directory, for commands that need nothing else.
 pub fn data_dir_only(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    layers(builtin, lookup).ok().and_then(|(l, _)| l.data_dir).unwrap_or_else(|| default_data_dir(lookup))
+    layers(builtin, lookup)
+        .ok()
+        .and_then(|(l, _)| l.data_dir)
+        .unwrap_or_else(|| default_data_dir(lookup))
 }
 
 pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> Result<Config, String> {
@@ -298,8 +334,18 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
         Some("http") => Some("http".to_string()),
         Some(other) => return Err(format!("scheme: {other:?} is not http or https")),
     };
-    let trusted_proxies = l.trusted_proxies.unwrap_or_default().iter().map(|s| Net::parse(s)).collect::<Result<_, _>>()?;
-    let relays = l.relays.unwrap_or_else(|| crate::node::config::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect());
+    let trusted_proxies = l
+        .trusted_proxies
+        .unwrap_or_default()
+        .iter()
+        .map(|s| Net::parse(s))
+        .collect::<Result<_, _>>()?;
+    let relays = l.relays.unwrap_or_else(|| {
+        crate::node::config::DEFAULT_RELAYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
     let check_relays = |rs: &[String]| -> Result<(), String> {
         if rs.is_empty() {
             return Err("relays: at least one relay is needed".into());
@@ -326,7 +372,12 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
                 return Err(format!("nodes: payee {p:?} is not a 33-byte hex node key"));
             }
         }
-        nodes.push(NodeConfig { pubkey, names, relays: node_relays, payee: n.payee.map(|p| p.to_lowercase()) });
+        nodes.push(NodeConfig {
+            pubkey,
+            names,
+            relays: node_relays,
+            payee: n.payee.map(|p| p.to_lowercase()),
+        });
     }
     let ll = l.limits.unwrap_or_default();
     let limits = Limits {
@@ -339,10 +390,26 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
     let admin = l.admin.unwrap_or_default();
     let admin_listen = admin.listen.as_deref().map(Listen::parse).transpose()?;
     if admin_listen.as_ref().is_some_and(|a| *a == listen) {
-        return Err("admin.listen must differ from listen: the admin interface never shares the public listener".into());
+        return Err(
+            "admin.listen must differ from listen: the admin interface never shares the public listener".into(),
+        );
     }
-    let secure_cookie = admin.secure_cookie.unwrap_or_else(|| !admin_listen.as_ref().is_some_and(Listen::is_loopback));
-    Ok(Config { data_dir, listen, domains, scheme_override, trusted_proxies, socks5, nodes, limits, admin_listen, secure_cookie, sources })
+    let secure_cookie = admin
+        .secure_cookie
+        .unwrap_or_else(|| !admin_listen.as_ref().is_some_and(Listen::is_loopback));
+    Ok(Config {
+        data_dir,
+        listen,
+        domains,
+        scheme_override,
+        trusted_proxies,
+        socks5,
+        nodes,
+        limits,
+        admin_listen,
+        secure_cookie,
+        sources,
+    })
 }
 
 #[cfg(test)]
@@ -355,7 +422,10 @@ pub mod tests {
     }
 
     fn minimal() -> Vec<(&'static str, String)> {
-        vec![("LNADDR_GATEWAY_DOMAIN", "pay.example".into()), ("LNADDR_GATEWAY_NODE", node_hex())]
+        vec![
+            ("LNADDR_GATEWAY_DOMAIN", "pay.example".into()),
+            ("LNADDR_GATEWAY_NODE", node_hex()),
+        ]
     }
 
     fn load_pairs(builtin: Option<&str>, pairs: &[(&str, String)]) -> Result<Config, String> {
@@ -376,7 +446,10 @@ pub mod tests {
         assert_eq!(c.origin("pay.example"), "https://pay.example");
         assert_eq!(c.origin("abc.onion"), "http://abc.onion");
         assert!(c.data_dir.ends_with("lnaddr-gateway-data"));
-        assert_eq!(data_dir_only(None, &env(&[("HOME", "/h")])), Path::new("/h/.local/share/deadhop-lnaddr/gateway"));
+        assert_eq!(
+            data_dir_only(None, &env(&[("HOME", "/h")])),
+            Path::new("/h/.local/share/deadhop-lnaddr/gateway")
+        );
     }
 
     #[test]
@@ -421,7 +494,10 @@ names = ["*"]
         assert_eq!(c.listen, Listen::Unix("/run/lnaddr.sock".into()));
         assert_eq!(c.listen.to_string(), "unix:/run/lnaddr.sock");
         assert!(c.listen.is_loopback());
-        assert_eq!(c.nodes[0].names.as_deref(), Some(&["alice".to_string(), "bob".to_string()][..]));
+        assert_eq!(
+            c.nodes[0].names.as_deref(),
+            Some(&["alice".to_string(), "bob".to_string()][..])
+        );
         assert_eq!(c.nodes[0].payee.as_deref(), Some("02".repeat(33).as_str()));
         assert_eq!(c.nodes[1].names, None);
         assert_eq!((c.limits.per_ip_per_minute, c.limits.global_per_minute), (5, 7));
@@ -437,7 +513,10 @@ names = ["*"]
     #[test]
     fn builtin_values_can_be_the_only_source() {
         let builtin = format!("domains = [\"only.example\"]\nnodes = [{{ pubkey = \"{}\" }}]\nsources = {{ file = false, env = false }}\n", node_hex());
-        let pairs = [("LNADDR_GATEWAY_DOMAIN", "other.example".to_string()), ("LNADDR_GATEWAY_CONFIG", "/nope".to_string())];
+        let pairs = [
+            ("LNADDR_GATEWAY_DOMAIN", "other.example".to_string()),
+            ("LNADDR_GATEWAY_CONFIG", "/nope".to_string()),
+        ];
         let c = load_pairs(Some(&builtin), &pairs).unwrap();
         assert_eq!(c.domains, ["only.example"]);
         assert!(!c.sources.env && !c.sources.file);
@@ -451,8 +530,16 @@ names = ["*"]
             ("LNADDR_GATEWAY_DOMAIN", "", "set the domain"),
             ("LNADDR_GATEWAY_DOMAIN", "https://x.io", "not a lower-case domain"),
             ("LNADDR_GATEWAY_SCHEME", "gopher", "not http or https"),
-            ("LNADDR_GATEWAY_TRUSTED_PROXIES", "10.0.0.0/99", "not an address or network"),
-            ("LNADDR_GATEWAY_TRUSTED_PROXIES", "10.0.0.0/x", "not an address or network"),
+            (
+                "LNADDR_GATEWAY_TRUSTED_PROXIES",
+                "10.0.0.0/99",
+                "not an address or network",
+            ),
+            (
+                "LNADDR_GATEWAY_TRUSTED_PROXIES",
+                "10.0.0.0/x",
+                "not an address or network",
+            ),
             ("LNADDR_GATEWAY_TRUSTED_PROXIES", "proxy", "not an address or network"),
             ("LNADDR_GATEWAY_RELAYS", "ws://relay.example.com", "must use wss://"),
             ("LNADDR_GATEWAY_RELAYS", ",", "at least one relay"),
@@ -462,7 +549,11 @@ names = ["*"]
             ("LNADDR_GATEWAY_PER_IP_PER_MINUTE", "many", "not a valid number"),
             ("LNADDR_GATEWAY_TIMEOUT_SECS", "soon", "not a valid number"),
             ("LNADDR_GATEWAY_ADMIN_SECURE_COOKIE", "maybe", "not on or off"),
-            ("LNADDR_GATEWAY_ADMIN_LISTEN", "127.0.0.1:8080", "must differ from listen"),
+            (
+                "LNADDR_GATEWAY_ADMIN_LISTEN",
+                "127.0.0.1:8080",
+                "must differ from listen",
+            ),
             ("LNADDR_GATEWAY_ADMIN_LISTEN", "nope", "not an address"),
             ("LNADDR_GATEWAY_CONFIG", "/does/not/exist", "/does/not/exist"),
         ];
@@ -474,10 +565,18 @@ names = ["*"]
             assert!(e.contains(want), "{k}={v}: {e}");
         }
         let node = |extra: &str| format!("domains = [\"x.io\"]\n[[nodes]]\npubkey = \"{}\"\n{extra}", node_hex());
-        assert!(load_pairs(Some(&node("names = [\"Bad\"]")), &[]).unwrap_err().contains("not a valid name"));
-        assert!(load_pairs(Some(&node("payee = \"02\"")), &[]).unwrap_err().contains("33-byte hex"));
-        assert!(load_pairs(Some(&node("relays = []")), &[]).unwrap_err().contains("at least one relay"));
-        assert!(load_pairs(Some("bogus = 1"), &minimal()).unwrap_err().contains("unknown field"));
+        assert!(load_pairs(Some(&node("names = [\"Bad\"]")), &[])
+            .unwrap_err()
+            .contains("not a valid name"));
+        assert!(load_pairs(Some(&node("payee = \"02\"")), &[])
+            .unwrap_err()
+            .contains("33-byte hex"));
+        assert!(load_pairs(Some(&node("relays = []")), &[])
+            .unwrap_err()
+            .contains("at least one relay"));
+        assert!(load_pairs(Some("bogus = 1"), &minimal())
+            .unwrap_err()
+            .contains("unknown field"));
         let public_admin = [("LNADDR_GATEWAY_ADMIN_LISTEN", "0.0.0.0:8081".to_string())];
         let mut pairs = minimal();
         pairs.extend(public_admin);

@@ -44,7 +44,9 @@ pub fn valid_domain(domain: &str) -> bool {
                 && label.len() <= 63
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
 }
 
@@ -56,7 +58,10 @@ pub fn is_onion(domain: &str) -> bool {
 /// The LUD-06 metadata string for `name@domain`: a JSON array holding the
 /// description and the identifier, always serialised the same way.
 pub fn metadata(name: &str, domain: &str, description: &str) -> String {
-    let entries = [["text/plain", description], ["text/identifier", &format!("{name}@{domain}")]];
+    let entries = [
+        ["text/plain", description],
+        ["text/identifier", &format!("{name}@{domain}")],
+    ];
     serde_json::to_string(&entries).expect("an array of strings always serialises")
 }
 
@@ -94,7 +99,10 @@ pub struct ErrorResponse {
 
 impl ErrorResponse {
     pub fn new(reason: impl Into<String>) -> Self {
-        ErrorResponse { status: "ERROR".into(), reason: reason.into() }
+        ErrorResponse {
+            status: "ERROR".into(),
+            reason: reason.into(),
+        }
     }
 }
 
@@ -119,7 +127,13 @@ mod tests {
 
     #[test]
     fn domains_are_plain_dns_names() {
-        for ok in ["example.com", "pay.example.com", "localhost:8080", "abc.onion", "a-b.io"] {
+        for ok in [
+            "example.com",
+            "pay.example.com",
+            "localhost:8080",
+            "abc.onion",
+            "a-b.io",
+        ] {
             assert!(valid_domain(ok), "{ok}");
         }
         for bad in [
@@ -151,9 +165,15 @@ mod tests {
     #[test]
     fn metadata_is_stable_and_escaped() {
         let m = metadata("alice", "example.com", "Pay \"alice\"");
-        assert_eq!(m, r#"[["text/plain","Pay \"alice\""],["text/identifier","alice@example.com"]]"#);
+        assert_eq!(
+            m,
+            r#"[["text/plain","Pay \"alice\""],["text/identifier","alice@example.com"]]"#
+        );
         assert_eq!(metadata("alice", "example.com", "Pay \"alice\""), m);
-        assert_eq!(hex::encode(description_hash("")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hex::encode(description_hash("")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
@@ -169,11 +189,18 @@ mod tests {
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["minSendable"], 1000);
         assert_eq!(v["commentAllowed"], 10);
-        let none = PayRequest { comment_allowed: None, ..p };
+        let none = PayRequest {
+            comment_allowed: None,
+            ..p
+        };
         assert!(serde_json::to_value(&none).unwrap().get("commentAllowed").is_none());
         let e = serde_json::to_value(ErrorResponse::new("no")).unwrap();
         assert_eq!(e, serde_json::json!({"status": "ERROR", "reason": "no"}));
-        let i = serde_json::to_value(InvoiceResponse { pr: "lnbc1".into(), routes: vec![] }).unwrap();
+        let i = serde_json::to_value(InvoiceResponse {
+            pr: "lnbc1".into(),
+            routes: vec![],
+        })
+        .unwrap();
         assert_eq!(i, serde_json::json!({"pr": "lnbc1", "routes": []}));
     }
 

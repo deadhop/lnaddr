@@ -23,7 +23,11 @@ impl RateLimiter {
         RateLimiter {
             global_per_min,
             per_key_per_min,
-            window: Mutex::new(Window { minute: 0, global: 0, keys: HashMap::new() }),
+            window: Mutex::new(Window {
+                minute: 0,
+                global: 0,
+                keys: HashMap::new(),
+            }),
         }
     }
 

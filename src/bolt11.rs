@@ -25,7 +25,9 @@ impl FromStr for Network {
             "testnet" => Ok(Network::Testnet),
             "signet" => Ok(Network::Signet),
             "regtest" => Ok(Network::Regtest),
-            other => Err(format!("unknown network {other:?} (bitcoin, testnet, signet or regtest)")),
+            other => Err(format!(
+                "unknown network {other:?} (bitcoin, testnet, signet or regtest)"
+            )),
         }
     }
 }
@@ -95,7 +97,10 @@ pub fn check(pr: &str, want: &Expect) -> Result<Checked, String> {
     if inv.would_expire(Duration::from_secs(want.now) + want.min_expiry) {
         return Err("invoice expires too soon".into());
     }
-    Ok(Checked { payment_hash: hex::encode(inv.payment_hash().to_byte_array()), payee })
+    Ok(Checked {
+        payment_hash: hex::encode(inv.payment_hash().to_byte_array()),
+        payee,
+    })
 }
 
 use nostr_sdk::hashes::Hash as _;
@@ -104,9 +109,9 @@ use nostr_sdk::hashes::Hash as _;
 pub mod testutil {
     //! Real, signed invoices for tests and fake Lightning backends.
     use super::*;
+    use lightning_invoice::{InvoiceBuilder, PaymentSecret};
     use nostr_sdk::hashes::sha256;
     use nostr_sdk::secp256k1::{Secp256k1, SecretKey};
-    use lightning_invoice::{InvoiceBuilder, PaymentSecret};
 
     pub const NODE_SECRET: [u8; 32] = [0x41; 32];
 
@@ -143,7 +148,14 @@ pub mod testutil {
 
     /// A regtest invoice from the test node, valid for an hour from now.
     pub fn invoice(amount_msat: u64, hash: [u8; 32]) -> String {
-        invoice_with(NODE_SECRET, Currency::Regtest, amount_msat, hash, crate::unix_now(), 3600)
+        invoice_with(
+            NODE_SECRET,
+            Currency::Regtest,
+            amount_msat,
+            hash,
+            crate::unix_now(),
+            3600,
+        )
     }
 
     /// The same with a plain description instead of a hash.
@@ -199,26 +211,57 @@ mod tests {
         let ok = check(&pr, &want(21_000, [9; 32])).unwrap();
         assert_eq!(ok.payee, node_pubkey());
         assert_eq!(ok.payment_hash.len(), 64);
-        let pinned = Expect { payee: Some(Box::leak(node_pubkey().to_uppercase().into_boxed_str())), ..want(21_000, [9; 32]) };
+        let pinned = Expect {
+            payee: Some(Box::leak(node_pubkey().to_uppercase().into_boxed_str())),
+            ..want(21_000, [9; 32])
+        };
         assert!(check(&format!(" {pr}\n"), &pinned).is_ok());
-        let any_net = Expect { network: None, ..want(21_000, [9; 32]) };
+        let any_net = Expect {
+            network: None,
+            ..want(21_000, [9; 32])
+        };
         assert!(check(&pr, &any_net).is_ok());
     }
 
     #[test]
     fn every_mismatch_is_refused() {
         let pr = invoice(21_000, [9; 32]);
-        assert!(check("lnbc1garbage", &want(1, [0; 32])).unwrap_err().contains("not a valid invoice"));
-        assert!(check(&"x".repeat(5000), &want(1, [0; 32])).unwrap_err().contains("too long"));
-        assert!(check(&pr, &want(21_001, [9; 32])).unwrap_err().contains("not 21001 msat"));
-        assert!(check(&pr, &want(21_000, [8; 32])).unwrap_err().contains("description hash"));
+        assert!(check("lnbc1garbage", &want(1, [0; 32]))
+            .unwrap_err()
+            .contains("not a valid invoice"));
+        assert!(check(&"x".repeat(5000), &want(1, [0; 32]))
+            .unwrap_err()
+            .contains("too long"));
+        assert!(check(&pr, &want(21_001, [9; 32]))
+            .unwrap_err()
+            .contains("not 21001 msat"));
+        assert!(check(&pr, &want(21_000, [8; 32]))
+            .unwrap_err()
+            .contains("description hash"));
         let plain = invoice_with_description(21_000);
-        assert!(check(&plain, &want(21_000, [9; 32])).unwrap_err().contains("description hash"));
-        let main = Expect { network: Some(Network::Bitcoin), ..want(21_000, [9; 32]) };
+        assert!(check(&plain, &want(21_000, [9; 32]))
+            .unwrap_err()
+            .contains("description hash"));
+        let main = Expect {
+            network: Some(Network::Bitcoin),
+            ..want(21_000, [9; 32])
+        };
         assert!(check(&pr, &main).unwrap_err().contains("not Bitcoin"));
-        let other = Expect { payee: Some("02aa"), ..want(21_000, [9; 32]) };
+        let other = Expect {
+            payee: Some("02aa"),
+            ..want(21_000, [9; 32])
+        };
         assert!(check(&pr, &other).unwrap_err().contains("not the pinned node"));
-        let old = invoice_with(NODE_SECRET, Currency::Regtest, 21_000, [9; 32], crate::unix_now() - 3600, 30);
-        assert!(check(&old, &want(21_000, [9; 32])).unwrap_err().contains("expires too soon"));
+        let old = invoice_with(
+            NODE_SECRET,
+            Currency::Regtest,
+            21_000,
+            [9; 32],
+            crate::unix_now() - 3600,
+            30,
+        );
+        assert!(check(&old, &want(21_000, [9; 32]))
+            .unwrap_err()
+            .contains("expires too soon"));
     }
 }

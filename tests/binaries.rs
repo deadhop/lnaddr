@@ -28,7 +28,12 @@ fn both_binaries_print_their_version() {
 
 /// Serve until `signal`, and check the process exits cleanly and promptly.
 fn serves_until(bin: &str, envs: &[(&str, String)], signal: i32) {
-    let mut child = clean(bin).envs(envs.iter().map(|(k, v)| (*k, v.as_str()))).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = clean(bin)
+        .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     // Wait for the "is serving" log line, then keep draining the log.
     let (tx, rx) = std::sync::mpsc::channel();
     let stderr = child.stderr.take().unwrap();
@@ -40,7 +45,8 @@ fn serves_until(bin: &str, envs: &[(&str, String)], signal: i32) {
             }
         }
     });
-    rx.recv_timeout(Duration::from_secs(30)).expect("the service never said it is serving");
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("the service never said it is serving");
     assert!(child.try_wait().unwrap().is_none(), "{bin} exited before the signal");
     assert_eq!(unsafe { kill(child.id() as i32, signal) }, 0);
     let started = Instant::now();
@@ -66,7 +72,10 @@ fn both_binaries_serve_until_a_signal() {
     let gateway = vec![
         ("LNADDR_GATEWAY_DATA_DIR", dir.path().join("gw").display().to_string()),
         ("LNADDR_GATEWAY_DOMAIN", "pay.example".to_string()),
-        ("LNADDR_GATEWAY_NODE", "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()),
+        (
+            "LNADDR_GATEWAY_NODE",
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
+        ),
         ("LNADDR_GATEWAY_RELAYS", "ws://127.0.0.1:9".to_string()),
         ("LNADDR_GATEWAY_LISTEN", "127.0.0.1:0".to_string()),
     ];
@@ -74,7 +83,10 @@ fn both_binaries_serve_until_a_signal() {
     let node = vec![
         ("LNADDR_NODE_DATA_DIR", dir.path().join("node").display().to_string()),
         ("LNADDR_NODE_RELAYS", "ws://127.0.0.1:9".to_string()),
-        ("LNADDR_NODE_GATEWAYS", "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()),
+        (
+            "LNADDR_NODE_GATEWAYS",
+            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
+        ),
         ("LNADDR_NODE_BACKEND", "phoenixd".to_string()),
         ("LNADDR_NODE_BACKEND_SECRET", "x".to_string()),
         ("LNADDR_NODE_ADDRESSES", "alice".to_string()),

@@ -207,7 +207,15 @@ mod tests {
             domains: vec![],
         };
         assert_eq!(p.address().comment_allowed, 5);
-        let l = SetLimitsParams { invoices_per_minute: Some(3), per_caller_per_minute: None, invoice_expiry_secs: Some(90) }.layer();
-        assert_eq!((l.invoices_per_minute, l.concurrent, l.invoice_expiry_secs), (Some(3), None, Some(90)));
+        let l = SetLimitsParams {
+            invoices_per_minute: Some(3),
+            per_caller_per_minute: None,
+            invoice_expiry_secs: Some(90),
+        }
+        .layer();
+        assert_eq!(
+            (l.invoices_per_minute, l.concurrent, l.invoice_expiry_secs),
+            (Some(3), None, Some(90))
+        );
     }
 }

@@ -78,13 +78,20 @@ pub struct Backend {
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Backend").field("kind", &self.kind).field("base", &self.base).finish_non_exhaustive()
+        f.debug_struct("Backend")
+            .field("kind", &self.kind)
+            .field("base", &self.base)
+            .finish_non_exhaustive()
     }
 }
 
 /// One printable line of at most 200 characters from a backend's reply.
 fn excerpt(body: &str) -> String {
-    let line: String = body.chars().map(|c| if c.is_control() { ' ' } else { c }).take(200).collect();
+    let line: String = body
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect();
     line.trim().to_string()
 }
 
@@ -99,7 +106,12 @@ impl Backend {
             .no_proxy()
             .build()
             .expect("a client with a rustls configuration always builds");
-        Backend { kind, base: base.trim_end_matches('/').to_string(), secret, http }
+        Backend {
+            kind,
+            base: base.trim_end_matches('/').to_string(),
+            secret,
+            http,
+        }
     }
 
     pub fn kind(&self) -> Kind {
@@ -122,13 +134,17 @@ impl Backend {
                     "expiry": r.expiry_secs.to_string(),
                     "memo": "",
                 })),
-            Kind::Cln => self.http.post(format!("{}/v1/invoice", self.base)).header("Rune", &self.secret).json(&json!({
-                "amount_msat": r.amount_msat,
-                "label": r.label,
-                "description": r.metadata,
-                "deschashonly": true,
-                "expiry": r.expiry_secs,
-            })),
+            Kind::Cln => self
+                .http
+                .post(format!("{}/v1/invoice", self.base))
+                .header("Rune", &self.secret)
+                .json(&json!({
+                    "amount_msat": r.amount_msat,
+                    "label": r.label,
+                    "description": r.metadata,
+                    "deschashonly": true,
+                    "expiry": r.expiry_secs,
+                })),
             Kind::Phoenixd => self
                 .http
                 .post(format!("{}/createinvoice", self.base))
@@ -139,8 +155,11 @@ impl Backend {
                     ("expirySeconds", r.expiry_secs.to_string()),
                     ("externalId", r.label.to_string()),
                 ]),
-            Kind::Lnbits => {
-                self.http.post(format!("{}/api/v1/payments", self.base)).header("X-Api-Key", &self.secret).json(&json!({
+            Kind::Lnbits => self
+                .http
+                .post(format!("{}/api/v1/payments", self.base))
+                .header("X-Api-Key", &self.secret)
+                .json(&json!({
                     "out": false,
                     "amount": sats,
                     "unit": "sat",
@@ -148,17 +167,32 @@ impl Backend {
                     "description_hash": hex::encode(hash),
                     "expiry": r.expiry_secs,
                     "extra": { "tag": "lnaddr", "label": r.label },
-                }))
-            }
+                })),
         };
-        let resp = req.send().await.map_err(|e| format!("the {} backend is unreachable: {e}", self.kind.name()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("the {} backend is unreachable: {e}", self.kind.name()))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| format!("the {} backend's reply broke off: {e}", self.kind.name()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("the {} backend's reply broke off: {e}", self.kind.name()))?;
         if !status.is_success() {
-            return Err(format!("the {} backend answered {}: {}", self.kind.name(), status.as_u16(), excerpt(&body)));
+            return Err(format!(
+                "the {} backend answered {}: {}",
+                self.kind.name(),
+                status.as_u16(),
+                excerpt(&body)
+            ));
         }
-        let v: Value = serde_json::from_str(&body)
-            .map_err(|_| format!("the {} backend did not answer with JSON: {}", self.kind.name(), excerpt(&body)))?;
+        let v: Value = serde_json::from_str(&body).map_err(|_| {
+            format!(
+                "the {} backend did not answer with JSON: {}",
+                self.kind.name(),
+                excerpt(&body)
+            )
+        })?;
         let field = match self.kind {
             Kind::Lnd => "payment_request",
             Kind::Cln => "bolt11",
@@ -212,7 +246,11 @@ pub mod testutil {
             Kind::Lnd => headers.get("grpc-metadata-macaroon").is_some_and(|v| v == SECRET),
             Kind::Cln => headers.get("rune").is_some_and(|v| v == SECRET),
             Kind::Phoenixd => headers.get("authorization").is_some_and(|v| {
-                v.to_str().unwrap() == format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!(":{SECRET}")))
+                v.to_str().unwrap()
+                    == format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!(":{SECRET}"))
+                    )
             }),
             Kind::Lnbits => headers.get("x-api-key").is_some_and(|v| v == SECRET),
         };
@@ -222,17 +260,28 @@ pub mod testutil {
         let num = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap();
         let (msat, hash) = match kind {
             Kind::Lnd => {
-                let h = base64::engine::general_purpose::STANDARD.decode(body["description_hash"].as_str().unwrap()).unwrap();
+                let h = base64::engine::general_purpose::STANDARD
+                    .decode(body["description_hash"].as_str().unwrap())
+                    .unwrap();
                 (num(&body["value_msat"]), h)
             }
             Kind::Cln => {
                 assert_eq!(body["deschashonly"], true);
-                (num(&body["amount_msat"]), description_hash(body["description"].as_str().unwrap()).to_vec())
+                (
+                    num(&body["amount_msat"]),
+                    description_hash(body["description"].as_str().unwrap()).to_vec(),
+                )
             }
-            Kind::Phoenixd => (num(&body["amountSat"]) * 1000, hex::decode(body["descriptionHash"].as_str().unwrap()).unwrap()),
+            Kind::Phoenixd => (
+                num(&body["amountSat"]) * 1000,
+                hex::decode(body["descriptionHash"].as_str().unwrap()).unwrap(),
+            ),
             Kind::Lnbits => {
                 assert_eq!(body["out"], false);
-                (num(&body["amount"]) * 1000, hex::decode(body["description_hash"].as_str().unwrap()).unwrap())
+                (
+                    num(&body["amount"]) * 1000,
+                    hex::decode(body["description_hash"].as_str().unwrap()).unwrap(),
+                )
             }
         };
         let msat = fake.wrong_amount.lock().unwrap().unwrap_or(msat);
@@ -249,21 +298,35 @@ pub mod testutil {
         Router::new()
             .route(
                 "/v1/invoices",
-                post(|State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move { answer(&f, h, b, Kind::Lnd).await }),
+                post(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move {
+                        answer(&f, h, b, Kind::Lnd).await
+                    },
+                ),
             )
             .route(
                 "/v1/invoice",
-                post(|State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move { answer(&f, h, b, Kind::Cln).await }),
+                post(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move {
+                        answer(&f, h, b, Kind::Cln).await
+                    },
+                ),
             )
             .route(
                 "/createinvoice",
-                post(|State(f): State<Arc<Fake>>, h: HeaderMap, Form(b): Form<HashMap<String, String>>| async move {
-                    answer(&f, h, json!(b), Kind::Phoenixd).await
-                }),
+                post(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Form(b): Form<HashMap<String, String>>| async move {
+                        answer(&f, h, json!(b), Kind::Phoenixd).await
+                    },
+                ),
             )
             .route(
                 "/api/v1/payments",
-                post(|State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move { answer(&f, h, b, Kind::Lnbits).await }),
+                post(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move {
+                        answer(&f, h, b, Kind::Lnbits).await
+                    },
+                ),
             )
             .with_state(fake)
     }
@@ -282,7 +345,10 @@ pub mod testutil {
         serve_with(fake, crate::tls::testutil::self_signed()).await
     }
 
-    pub async fn serve_with(fake: Arc<Fake>, cert: crate::tls::testutil::SelfSigned) -> (String, crate::tls::testutil::SelfSigned) {
+    pub async fn serve_with(
+        fake: Arc<Fake>,
+        cert: crate::tls::testutil::SelfSigned,
+    ) -> (String, crate::tls::testutil::SelfSigned) {
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use hyper_util::service::TowerToHyperService;
         let acceptor = cert.acceptor.clone();
@@ -316,7 +382,12 @@ mod tests {
     const META: &str = "[[\"text/plain\",\"hi\"]]";
 
     fn req(amount_msat: u64) -> Request<'static> {
-        Request { amount_msat, metadata: META, expiry_secs: 600, label: "lnaddr-1" }
+        Request {
+            amount_msat,
+            metadata: META,
+            expiry_secs: 600,
+            label: "lnaddr-1",
+        }
     }
 
     fn check(pr: &str, msat: u64) {
@@ -333,7 +404,13 @@ mod tests {
 
     #[test]
     fn kinds_parse_and_describe_themselves() {
-        for (s, k) in [("lnd", Kind::Lnd), ("cln", Kind::Cln), ("clnrest", Kind::Cln), ("phoenixd", Kind::Phoenixd), ("lnbits", Kind::Lnbits)] {
+        for (s, k) in [
+            ("lnd", Kind::Lnd),
+            ("cln", Kind::Cln),
+            ("clnrest", Kind::Cln),
+            ("phoenixd", Kind::Phoenixd),
+            ("lnbits", Kind::Lnbits),
+        ] {
             assert_eq!(s.parse::<Kind>().unwrap(), k);
             assert!(k.default_url().contains("127.0.0.1"));
             assert!(s.starts_with(k.name()));
@@ -354,23 +431,47 @@ mod tests {
             check(&pr, 21_000);
         }
         assert_eq!(fake.calls.load(Ordering::SeqCst), 4);
-        assert!(format!("{:?}", Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(1))).contains("Lnd"));
-        assert!(!format!("{:?}", Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(1))).contains(SECRET));
+        assert!(format!(
+            "{:?}",
+            Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(1))
+        )
+        .contains("Lnd"));
+        assert!(!format!(
+            "{:?}",
+            Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(1))
+        )
+        .contains(SECRET));
     }
 
     #[tokio::test]
     async fn a_pinned_self_signed_backend_is_trusted_and_nothing_else() {
         let fake = Arc::new(Fake::default());
         let (url, cert) = serve_tls(fake).await;
-        let pinned = Backend::new(Kind::Lnd, &url, SECRET.into(), Some(crate::tls::fingerprint(&cert.der)), Duration::from_secs(5));
+        let pinned = Backend::new(
+            Kind::Lnd,
+            &url,
+            SECRET.into(),
+            Some(crate::tls::fingerprint(&cert.der)),
+            Duration::from_secs(5),
+        );
         check(&pinned.create_invoice(&req(5_000)).await.unwrap(), 5_000);
         let wrong = Backend::new(Kind::Lnd, &url, SECRET.into(), Some([0; 32]), Duration::from_secs(5));
-        assert!(wrong.create_invoice(&req(5_000)).await.unwrap_err().contains("unreachable"));
+        assert!(wrong
+            .create_invoice(&req(5_000))
+            .await
+            .unwrap_err()
+            .contains("unreachable"));
         let roots = Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(5));
         assert!(roots.create_invoice(&req(5_000)).await.is_err());
         // An older backend that only speaks TLS 1.2.
         let (url12, cert12) = serve_with(Arc::new(Fake::default()), crate::tls::testutil::self_signed_tls12()).await;
-        let old = Backend::new(Kind::Cln, &url12, SECRET.into(), Some(crate::tls::fingerprint(&cert12.der)), Duration::from_secs(5));
+        let old = Backend::new(
+            Kind::Cln,
+            &url12,
+            SECRET.into(),
+            Some(crate::tls::fingerprint(&cert12.der)),
+            Duration::from_secs(5),
+        );
         check(&old.create_invoice(&req(5_000)).await.unwrap(), 5_000);
     }
 
@@ -379,21 +480,47 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let url = serve(fake.clone()).await;
         let bad_key = Backend::new(Kind::Cln, &url, "nope".into(), None, Duration::from_secs(5));
-        assert!(bad_key.create_invoice(&req(1_000)).await.unwrap_err().contains("answered 401"));
+        assert!(bad_key
+            .create_invoice(&req(1_000))
+            .await
+            .unwrap_err()
+            .contains("answered 401"));
         *fake.fail.lock().unwrap() = Some((500, format!("boom\n{}", "x".repeat(500))));
         let b = Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(5));
         let e = b.create_invoice(&req(1_000)).await.unwrap_err();
         assert!(e.contains("answered 500: boom x") && e.len() < 260, "{e}");
         *fake.fail.lock().unwrap() = Some((200, "<html>".into()));
-        assert!(b.create_invoice(&req(1_000)).await.unwrap_err().contains("did not answer with JSON"));
+        assert!(b
+            .create_invoice(&req(1_000))
+            .await
+            .unwrap_err()
+            .contains("did not answer with JSON"));
         *fake.fail.lock().unwrap() = Some((200, "{}".into()));
-        assert!(b.create_invoice(&req(1_000)).await.unwrap_err().contains("has no payment_request"));
+        assert!(b
+            .create_invoice(&req(1_000))
+            .await
+            .unwrap_err()
+            .contains("has no payment_request"));
         *fake.fail.lock().unwrap() = None;
         *fake.delay.lock().unwrap() = Some(Duration::from_secs(3));
         let quick = Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_millis(300));
-        assert!(quick.create_invoice(&req(1_000)).await.unwrap_err().contains("unreachable"));
-        let gone = Backend::new(Kind::Lnd, "http://127.0.0.1:9", SECRET.into(), None, Duration::from_secs(1));
-        assert!(gone.create_invoice(&req(1_000)).await.unwrap_err().contains("unreachable"));
+        assert!(quick
+            .create_invoice(&req(1_000))
+            .await
+            .unwrap_err()
+            .contains("unreachable"));
+        let gone = Backend::new(
+            Kind::Lnd,
+            "http://127.0.0.1:9",
+            SECRET.into(),
+            None,
+            Duration::from_secs(1),
+        );
+        assert!(gone
+            .create_invoice(&req(1_000))
+            .await
+            .unwrap_err()
+            .contains("unreachable"));
     }
 
     #[tokio::test]
@@ -405,7 +532,9 @@ mod tests {
             let (mut s, _) = l.accept().await.unwrap();
             let mut buf = [0u8; 4096];
             let _ = s.read(&mut buf).await;
-            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"a\"").await.unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"a\"")
+                .await
+                .unwrap();
         });
         let b = Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(5));
         assert!(b.create_invoice(&req(1_000)).await.unwrap_err().contains("broke off"));

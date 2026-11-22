@@ -27,7 +27,9 @@ impl Pool {
         if let Some(addr) = socks5 {
             opts = opts.connection(Connection::new().proxy(addr));
         }
-        Pool { client: Arc::new(Client::builder().signer(keys).opts(opts).build()) }
+        Pool {
+            client: Arc::new(Client::builder().signer(keys).opts(opts).build()),
+        }
     }
 
     /// How many relays are connected right now.
@@ -165,14 +167,18 @@ pub mod tests {
         let (bad, _task) = black_hole_relay().await;
         let keys = Keys::generate();
         let pool = Pool::new(keys.clone(), None);
-        pool.connect(&[good.url().await.to_string(), bad.clone()]).await.unwrap();
+        pool.connect(&[good.url().await.to_string(), bad.clone()])
+            .await
+            .unwrap();
         pool.client.wait_for_connection(Duration::from_secs(5)).await;
         let started = Instant::now();
         pool.publish_event(&note(&keys)).await.unwrap();
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         assert!(pool.connected().await >= 1);
         // Sending to the hanging relay alone is refused once it times out.
-        let only = pool.publish_to(&[good.url().await.to_string() + "/"], EventBuilder::text_note("x")).await;
+        let only = pool
+            .publish_to(&[good.url().await.to_string() + "/"], EventBuilder::text_note("x"))
+            .await;
         assert!(only.is_ok());
     }
 
@@ -206,6 +212,9 @@ pub mod tests {
         // With no relay connected both fail.
         let empty = Pool::new(keys, None);
         assert!(empty.subscribe(vec![Filter::new()]).await.is_err());
-        assert!(empty.fetch_events(vec![Filter::new()], Duration::from_millis(50)).await.is_err());
+        assert!(empty
+            .fetch_events(vec![Filter::new()], Duration::from_millis(50))
+            .await
+            .is_err());
     }
 }

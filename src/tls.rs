@@ -70,7 +70,9 @@ pub fn first_pem_cert(pem: &str) -> Result<Vec<u8>, String> {
     use base64::Engine;
     let begin = "-----BEGIN CERTIFICATE-----";
     let start = pem.find(begin).ok_or("no certificate in the PEM file")? + begin.len();
-    let end = pem[start..].find("-----END CERTIFICATE-----").ok_or("unterminated certificate in the PEM file")?;
+    let end = pem[start..]
+        .find("-----END CERTIFICATE-----")
+        .ok_or("unterminated certificate in the PEM file")?;
     let body: String = pem[start..start + end].chars().filter(|c| !c.is_whitespace()).collect();
     base64::engine::general_purpose::STANDARD
         .decode(body)
@@ -92,7 +94,10 @@ pub fn client_config(pin: Option<[u8; 32]>) -> rustls::ClientConfig {
         .with_safe_default_protocol_versions()
         .expect("the ring provider supports the default protocol versions");
     match pin {
-        Some(pin) => builder.dangerous().with_custom_certificate_verifier(Arc::new(Pinned { pin, algs })).with_no_client_auth(),
+        Some(pin) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pinned { pin, algs }))
+            .with_no_client_auth(),
         None => {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -135,14 +140,22 @@ pub mod testutil {
         let der = cert.cert.der().to_vec();
         let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let versions: &[&rustls::SupportedProtocolVersion] = if tls12_only { &[&rustls::version::TLS12] } else { rustls::DEFAULT_VERSIONS };
+        let versions: &[&rustls::SupportedProtocolVersion] = if tls12_only {
+            &[&rustls::version::TLS12]
+        } else {
+            rustls::DEFAULT_VERSIONS
+        };
         let config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(versions)
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![der.clone().into()], key)
             .unwrap();
-        SelfSigned { der, pem: cert.cert.pem(), acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)) }
+        SelfSigned {
+            der,
+            pem: cert.cert.pem(),
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+        }
     }
 }
 
@@ -165,7 +178,9 @@ mod tests {
         let s = testutil::self_signed();
         assert_eq!(first_pem_cert(&s.pem).unwrap(), s.der);
         assert!(first_pem_cert("nothing").unwrap_err().contains("no certificate"));
-        assert!(first_pem_cert("-----BEGIN CERTIFICATE-----abc").unwrap_err().contains("unterminated"));
+        assert!(first_pem_cert("-----BEGIN CERTIFICATE-----abc")
+            .unwrap_err()
+            .contains("unterminated"));
         let bad = "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----";
         assert!(first_pem_cert(bad).unwrap_err().contains("not valid base64"));
     }

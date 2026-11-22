@@ -16,6 +16,13 @@ pub mod ratelimit;
 pub mod settings;
 pub mod tls;
 
+/// Resolves when the service should stop. Boxed, so the functions taking it
+/// are compiled once rather than once per kind of future.
+pub type Shutdown = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// Reads a configuration variable by name.
+pub type Lookup = Box<dyn Fn(&str) -> Option<String>>;
+
 /// An error as text, for errors that are passed on rather than handled.
 pub fn why(e: impl std::fmt::Display) -> String {
     e.to_string()

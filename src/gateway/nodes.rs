@@ -103,7 +103,10 @@ pub struct NodeLink {
 
 impl NodeLink {
     pub fn new(cfg: NodeConfig, keys: Keys, socks5: Option<SocketAddr>, timeout: Duration) -> Self {
-        let health = Health { npub: cfg.pubkey.to_bech32().expect("keys encode"), ..Default::default() };
+        let health = Health {
+            npub: cfg.pubkey.to_bech32().expect("keys encode"),
+            ..Default::default()
+        };
         NodeLink {
             cfg,
             keys,
@@ -121,21 +124,24 @@ impl NodeLink {
         if let Some(c) = slot.as_ref() {
             return Ok(c.clone());
         }
-        let c = NodeClient::connect(self.keys.clone(), &self.cfg.pubkey, &self.cfg.relays, self.socks5, self.timeout)
-            .await
-            .map(Arc::new)
-            .map_err(CallError::Closed)?;
+        let (keys, node, relays) = (self.keys.clone(), &self.cfg.pubkey, &self.cfg.relays);
+        let connected = NodeClient::connect(keys, node, relays, self.socks5, self.timeout).await;
+        let c = Arc::new(connected.map_err(CallError::Closed)?);
         *slot = Some(c.clone());
         Ok(c)
     }
 
     /// Call a tool, rebuilding the client once if its connection is gone.
     pub async fn call<T: serde::de::DeserializeOwned>(&self, tool: &'static str, args: Value) -> Result<T, CallError> {
+        self.call_value(tool, args).await.and_then(crate::cvm::decode)
+    }
+
+    async fn call_value(&self, tool: &'static str, args: Value) -> Result<Value, CallError> {
         let started = Instant::now();
-        let mut outcome = self.client().await?.call(tool, args.clone()).await;
+        let mut outcome = self.client().await?.call_value(tool, args.clone()).await;
         if matches!(outcome, Err(CallError::Closed(_))) {
             *self.client.lock().await = None;
-            outcome = self.client().await?.call(tool, args).await;
+            outcome = self.client().await?.call_value(tool, args).await;
         }
         let mut h = lock(&self.health);
         match &outcome {
@@ -156,7 +162,10 @@ impl NodeLink {
     pub async fn refresh(&self) -> Result<(), CallError> {
         *lock(&self.last_refresh_try) = Some(Instant::now());
         let list: AddressList = self.call(proto::LIST_ADDRESSES, json!({})).await?;
-        *write(&self.cache) = Some(Snapshot { list, at: Instant::now() });
+        *write(&self.cache) = Some(Snapshot {
+            list,
+            at: Instant::now(),
+        });
         Ok(())
     }
 
@@ -178,7 +187,11 @@ impl NodeLink {
         }
         let cache = read(&self.cache);
         let snap = cache.as_ref()?;
-        let a = snap.list.addresses.iter().find(|a| a.name == name && a.serves(domain))?;
+        let a = snap
+            .list
+            .addresses
+            .iter()
+            .find(|a| a.name == name && a.serves(domain))?;
         Some((a.clone(), snap.list.network.parse().ok()))
     }
 
@@ -197,14 +210,17 @@ impl NodeLink {
     }
 
     pub fn addresses(&self) -> Vec<AddressInfo> {
-        read(&self.cache).as_ref().map(|s| s.list.addresses.clone()).unwrap_or_default()
+        read(&self.cache)
+            .as_ref()
+            .map(|s| s.list.addresses.clone())
+            .unwrap_or_default()
     }
 
     pub async fn close(&self) {
-        if let Some(c) = self.client.lock().await.take() {
-            if let Ok(c) = Arc::try_unwrap(c) {
-                c.close().await;
-            }
+        // Only the last holder closes it; a call still in flight keeps it alive.
+        let last = self.client.lock().await.take().and_then(|c| Arc::try_unwrap(c).ok());
+        if let Some(c) = last {
+            c.close().await;
         }
     }
 }
@@ -279,7 +295,10 @@ impl Directory {
         // Each call gets a share of the request's deadline so a retry still fits.
         let per_call = timeout.mul_f64(0.45);
         Directory {
-            nodes: nodes.into_iter().map(|n| NodeLink::new(n, keys.clone(), socks5, per_call)).collect(),
+            nodes: nodes
+                .into_iter()
+                .map(|n| NodeLink::new(n, keys.clone(), socks5, per_call))
+                .collect(),
             metrics: Metrics::default(),
             timeout,
         }
@@ -295,7 +314,10 @@ impl Directory {
     }
 
     fn find_cached(&self, name: &str, domain: &str) -> Option<(usize, AddressInfo, Option<Network>)> {
-        self.nodes.iter().enumerate().find_map(|(i, n)| n.lookup(name, domain).map(|(a, net)| (i, a, net)))
+        self.nodes
+            .iter()
+            .enumerate()
+            .find_map(|(i, n)| n.lookup(name, domain).map(|(a, net)| (i, a, net)))
     }
 
     /// The address `name@domain`, refreshing (rate-limited) on a miss.
@@ -315,7 +337,13 @@ impl Directory {
     }
 
     /// An invoice for `amount_msat` to `name@domain`, checked before it is returned.
-    pub async fn invoice(&self, name: &str, domain: &str, amount_msat: u64, comment: Option<String>) -> Result<String, Fail> {
+    pub async fn invoice(
+        &self,
+        name: &str,
+        domain: &str,
+        amount_msat: u64,
+        comment: Option<String>,
+    ) -> Result<String, Fail> {
         let outcome = self.invoice_inner(name, domain, amount_msat, comment).await;
         match &outcome {
             Ok(_) => {
@@ -326,19 +354,36 @@ impl Directory {
         outcome
     }
 
-    async fn invoice_inner(&self, name: &str, domain: &str, amount_msat: u64, comment: Option<String>) -> Result<String, Fail> {
+    async fn invoice_inner(
+        &self,
+        name: &str,
+        domain: &str,
+        amount_msat: u64,
+        comment: Option<String>,
+    ) -> Result<String, Fail> {
         let started = Instant::now();
         let (i, addr, network) = self.find(name, domain).await?;
         if amount_msat < addr.min_sendable || amount_msat > addr.max_sendable {
-            return Err(Fail::Invalid(format!("amount must be {} to {} msat", addr.min_sendable, addr.max_sendable)));
+            return Err(Fail::Invalid(format!(
+                "amount must be {} to {} msat",
+                addr.min_sendable, addr.max_sendable
+            )));
         }
         if let Some(c) = &comment {
             if !lnurl::comment_fits(c, addr.comment_allowed) {
-                return Err(Fail::Invalid(format!("comments are at most {} characters", addr.comment_allowed)));
+                return Err(Fail::Invalid(format!(
+                    "comments are at most {} characters",
+                    addr.comment_allowed
+                )));
             }
         }
         let node = &self.nodes[i];
-        let args = json!(proto::MakeInvoiceParams { name: name.into(), domain: domain.into(), amount_msat, comment });
+        let args = json!(proto::MakeInvoiceParams {
+            name: name.into(),
+            domain: domain.into(),
+            amount_msat,
+            comment
+        });
         let mut made: Result<MadeInvoice, CallError> = node.call(proto::MAKE_INVOICE, args.clone()).await;
         if made == Err(CallError::Timeout) && started.elapsed() < self.timeout / 2 {
             self.metrics.retries.fetch_add(1, Ordering::Relaxed);
@@ -358,10 +403,10 @@ impl Directory {
         if checked.is_err() {
             // The description may have just changed on the node: refresh once and recheck.
             let _ = node.refresh().await;
-            if let Some((fresh, _)) = node.lookup(name, domain) {
-                description = fresh.description;
-                checked = self.check(node, &made.pr, name, domain, &description, amount_msat, network);
-            }
+            description = node
+                .lookup(name, domain)
+                .map_or(description, |(fresh, _)| fresh.description);
+            checked = self.check(node, &made.pr, name, domain, &description, amount_msat, network);
         }
         if let Err(e) = checked {
             tracing::error!(%name, %domain, error = %e, "refused an invoice from the node");
@@ -428,7 +473,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_without_a_client_reports_no_relays() {
-        let cfg = NodeConfig { pubkey: Keys::generate().public_key(), names: None, relays: vec!["ws://127.0.0.1:9".into()], payee: None };
+        let cfg = NodeConfig {
+            pubkey: Keys::generate().public_key(),
+            names: None,
+            relays: vec!["ws://127.0.0.1:9".into()],
+            payee: None,
+        };
         let link = NodeLink::new(cfg, Keys::generate(), None, Duration::from_secs(1));
         let h = link.health().await;
         assert_eq!((h.relays_connected, h.reachable, h.addresses), (0, false, 0));

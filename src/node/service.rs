@@ -28,7 +28,10 @@ pub struct Refusal {
 }
 
 fn refuse(code: &'static str, message: impl Into<String>) -> Refusal {
-    Refusal { code, message: message.into() }
+    Refusal {
+        code,
+        message: message.into(),
+    }
 }
 
 /// Who is calling: the key that signed the request, and the request itself.
@@ -43,6 +46,9 @@ enum Role {
     Gateway,
     Admin,
 }
+
+/// One change to the settings an admin may make.
+type Change<'a> = Box<dyn FnOnce(&mut Mutable) -> Result<(), Refusal> + 'a>;
 
 struct Mutable {
     addresses: BTreeMap<String, Address>,
@@ -88,9 +94,16 @@ impl Service {
     pub fn with_clock(cfg: Config, now: fn() -> u64) -> Self {
         let b = &cfg.backend;
         let backend = Backend::new(b.kind, &b.url, b.secret.clone(), b.pin, b.timeout);
-        let limiter = std::sync::Arc::new(RateLimiter::new(cfg.limits.invoices_per_minute, cfg.limits.per_caller_per_minute));
+        let limiter = std::sync::Arc::new(RateLimiter::new(
+            cfg.limits.invoices_per_minute,
+            cfg.limits.per_caller_per_minute,
+        ));
         Service {
-            state: RwLock::new(Mutable { addresses: cfg.addresses.clone(), limits: cfg.limits.clone(), limiter }),
+            state: RwLock::new(Mutable {
+                addresses: cfg.addresses.clone(),
+                limits: cfg.limits.clone(),
+                limiter,
+            }),
             permits: Semaphore::new(cfg.limits.concurrent as usize),
             backend,
             cfg,
@@ -125,7 +138,10 @@ impl Service {
         };
         if let Some(e) = &c.event {
             if e.created_at.as_secs().abs_diff((self.now)()) > MAX_CLOCK_SKEW_SECS {
-                return Err(refuse(code::UNAUTHORIZED, "the request's timestamp is too far from the node's clock"));
+                return Err(refuse(
+                    code::UNAUTHORIZED,
+                    "the request's timestamp is too far from the node's clock",
+                ));
             }
         }
         Ok(role)
@@ -140,8 +156,17 @@ impl Service {
 
     pub fn list_addresses(&self, c: &Caller) -> Result<AddressList, Refusal> {
         self.role(c)?;
-        let addresses = self.read().addresses.iter().map(|(n, a)| AddressInfo::new(n, a)).collect();
-        Ok(AddressList { addresses, payee: lock(&self.payee).clone(), network: network_name(self.cfg.network).into() })
+        let addresses = self
+            .read()
+            .addresses
+            .iter()
+            .map(|(n, a)| AddressInfo::new(n, a))
+            .collect();
+        Ok(AddressList {
+            addresses,
+            payee: lock(&self.payee).clone(),
+            network: network_name(self.cfg.network).into(),
+        })
     }
 
     pub async fn make_invoice(&self, c: &Caller, p: MakeInvoiceParams) -> Result<MadeInvoice, Refusal> {
@@ -152,20 +177,29 @@ impl Service {
         };
         let address = address.ok_or_else(|| refuse(code::NOT_FOUND, format!("no address {:?} here", p.name)))?;
         if !lnurl::valid_domain(&p.domain) || !(address.domains.is_empty() || address.domains.contains(&p.domain)) {
-            return Err(refuse(code::NOT_FOUND, format!("{} is not served under {}", p.name, p.domain)));
+            return Err(refuse(
+                code::NOT_FOUND,
+                format!("{} is not served under {}", p.name, p.domain),
+            ));
         }
         if p.amount_msat < address.min_sendable || p.amount_msat > address.max_sendable {
             return Err(refuse(
                 code::INVALID,
-                format!("amount must be {} to {} msat", address.min_sendable, address.max_sendable),
+                format!(
+                    "amount must be {} to {} msat",
+                    address.min_sendable, address.max_sendable
+                ),
             ));
         }
-        if self.backend.kind().whole_sats() && p.amount_msat % 1000 != 0 {
+        if self.backend.kind().whole_sats() && !p.amount_msat.is_multiple_of(1000) {
             return Err(refuse(code::INVALID, "amount must be whole satoshis"));
         }
         let comment = p.comment.as_deref().unwrap_or("");
         if !lnurl::comment_fits(comment, address.comment_allowed) {
-            return Err(refuse(code::INVALID, format!("comments are at most {} characters", address.comment_allowed)));
+            return Err(refuse(
+                code::INVALID,
+                format!("comments are at most {} characters", address.comment_allowed),
+            ));
         }
         if !limiter.allow(c.pubkey.as_deref().unwrap_or_default(), (self.now)()) {
             return Err(refuse(code::RATE_LIMITED, "too many invoices; try again in a minute"));
@@ -176,8 +210,17 @@ impl Service {
             .map_err(|_| refuse(code::BUSY, "the node is busy; try again"))?
             .expect("the semaphore is never closed");
         let metadata = lnurl::metadata(&p.name, &p.domain, &address.description);
-        let label = format!("lnaddr-{}-{}", p.name, hex::encode(nostr_sdk::Keys::generate().public_key().to_bytes())[..16].to_owned());
-        let req = Request { amount_msat: p.amount_msat, metadata: &metadata, expiry_secs: limits.invoice_expiry_secs, label: &label };
+        let label = format!(
+            "lnaddr-{}-{}",
+            p.name,
+            hex::encode(nostr_sdk::Keys::generate().public_key().to_bytes())[..16].to_owned()
+        );
+        let req = Request {
+            amount_msat: p.amount_msat,
+            metadata: &metadata,
+            expiry_secs: limits.invoice_expiry_secs,
+            label: &label,
+        };
         let pr = match self.backend.create_invoice(&req).await {
             Ok(pr) => pr,
             Err(e) => return Err(self.failure(e)),
@@ -190,11 +233,15 @@ impl Service {
             now: (self.now)(),
             min_expiry: Duration::from_secs(30),
         };
-        let checked = bolt11::check(&pr, &want).map_err(|e| self.failure(format!("the backend's invoice was refused: {e}")))?;
+        let checked =
+            bolt11::check(&pr, &want).map_err(|e| self.failure(format!("the backend's invoice was refused: {e}")))?;
         *lock(&self.payee) = Some(checked.payee);
         self.made.fetch_add(1, Ordering::Relaxed);
         tracing::info!(name = %p.name, msat = p.amount_msat, comment = %comment, "invoice made");
-        Ok(MadeInvoice { pr, payment_hash: checked.payment_hash })
+        Ok(MadeInvoice {
+            pr,
+            payment_hash: checked.payment_hash,
+        })
     }
 
     /// Record a backend failure; the caller learns only that it failed.
@@ -248,20 +295,28 @@ impl Service {
                 invoice_expiry_secs: s.limits.invoice_expiry_secs,
             },
             addresses: s.addresses.iter().map(|(n, a)| AddressInfo::new(n, a)).collect(),
-            sources: proto::SourcesView { file: self.cfg.sources.file, env: self.cfg.sources.env, remote: self.cfg.sources.remote },
+            sources: proto::SourcesView {
+                file: self.cfg.sources.file,
+                env: self.cfg.sources.env,
+                remote: self.cfg.sources.remote,
+            },
         })
     }
 
     /// Change settings over ContextVM: admins only, and only when remote
     /// settings are switched on. The change is saved before it takes effect.
-    fn change(&self, c: &Caller, f: impl FnOnce(&mut Mutable) -> Result<(), Refusal>) -> Result<ConfigView, Refusal> {
+    fn change(&self, c: &Caller, f: Change<'_>) -> Result<ConfigView, Refusal> {
         self.admin(c)?;
         if !self.cfg.sources.remote {
             return Err(refuse(code::LOCKED, "remote settings are switched off on this node"));
         }
         {
             let mut s = self.write();
-            let mut next = Mutable { addresses: s.addresses.clone(), limits: s.limits.clone(), limiter: s.limiter.clone() };
+            let mut next = Mutable {
+                addresses: s.addresses.clone(),
+                limits: s.limits.clone(),
+                limiter: s.limiter.clone(),
+            };
             f(&mut next)?;
             next.limits.validate().map_err(|e| refuse(code::INVALID, e))?;
             let saved = Remote {
@@ -278,39 +333,54 @@ impl Service {
                 refuse(code::INTERNAL, "the node could not save the change")
             })?;
             if next.limits != s.limits {
-                next.limiter = std::sync::Arc::new(RateLimiter::new(next.limits.invoices_per_minute, next.limits.per_caller_per_minute));
+                next.limiter = std::sync::Arc::new(RateLimiter::new(
+                    next.limits.invoices_per_minute,
+                    next.limits.per_caller_per_minute,
+                ));
             }
             *s = next;
         }
-        tracing::info!(by = c.pubkey.as_deref().unwrap_or_default(), "settings changed over ContextVM");
+        tracing::info!(
+            by = c.pubkey.as_deref().unwrap_or_default(),
+            "settings changed over ContextVM"
+        );
         self.config_view(c)
     }
 
     pub fn set_address(&self, c: &Caller, p: proto::SetAddressParams) -> Result<ConfigView, Refusal> {
         let kind = self.backend.kind();
-        self.change(c, |s| {
-            let a = p.address();
-            a.validate(&p.name, kind).map_err(|e| refuse(code::INVALID, e))?;
-            s.addresses.insert(p.name.clone(), a);
-            Ok(())
-        })
+        self.change(
+            c,
+            Box::new(|s| {
+                let a = p.address();
+                a.validate(&p.name, kind).map_err(|e| refuse(code::INVALID, e))?;
+                s.addresses.insert(p.name.clone(), a);
+                Ok(())
+            }),
+        )
     }
 
     pub fn remove_address(&self, c: &Caller, p: proto::RemoveAddressParams) -> Result<ConfigView, Refusal> {
-        self.change(c, |s| match s.addresses.remove(&p.name) {
-            Some(_) => Ok(()),
-            None => Err(refuse(code::NOT_FOUND, format!("no address {:?} here", p.name))),
-        })
+        self.change(
+            c,
+            Box::new(|s| match s.addresses.remove(&p.name) {
+                Some(_) => Ok(()),
+                None => Err(refuse(code::NOT_FOUND, format!("no address {:?} here", p.name))),
+            }),
+        )
     }
 
     pub fn set_limits(&self, c: &Caller, p: proto::SetLimitsParams) -> Result<ConfigView, Refusal> {
-        self.change(c, |s| {
-            let l = p.layer();
-            s.limits.invoices_per_minute = l.invoices_per_minute.unwrap_or(s.limits.invoices_per_minute);
-            s.limits.per_caller_per_minute = l.per_caller_per_minute.unwrap_or(s.limits.per_caller_per_minute);
-            s.limits.invoice_expiry_secs = l.invoice_expiry_secs.unwrap_or(s.limits.invoice_expiry_secs);
-            Ok(())
-        })
+        self.change(
+            c,
+            Box::new(|s| {
+                let l = p.layer();
+                s.limits.invoices_per_minute = l.invoices_per_minute.unwrap_or(s.limits.invoices_per_minute);
+                s.limits.per_caller_per_minute = l.per_caller_per_minute.unwrap_or(s.limits.per_caller_per_minute);
+                s.limits.invoice_expiry_secs = l.invoice_expiry_secs.unwrap_or(s.limits.invoice_expiry_secs);
+                Ok(())
+            }),
+        )
     }
 }
 
@@ -333,13 +403,25 @@ pub mod tests {
 
     pub fn test_config(url: &str, kind: Kind, data_dir: &std::path::Path) -> Config {
         let mut addresses = BTreeMap::new();
-        addresses.insert("alice".to_string(), Address { comment_allowed: 10, ..Address::default_for("alice") });
+        addresses.insert(
+            "alice".to_string(),
+            Address {
+                comment_allowed: 10,
+                ..Address::default_for("alice")
+            },
+        );
         addresses.insert(
             "bob".to_string(),
-            Address { domains: vec!["bob.example".into()], ..Address::default_for("bob") },
+            Address {
+                domains: vec!["bob.example".into()],
+                ..Address::default_for("bob")
+            },
         );
         let mut sources = Sources::default();
-        sources.apply(&SourcesLayer { remote: Some(true), ..Default::default() });
+        sources.apply(&SourcesLayer {
+            remote: Some(true),
+            ..Default::default()
+        });
         Config {
             data_dir: data_dir.to_path_buf(),
             relays: vec!["ws://127.0.0.1:1".into()],
@@ -347,7 +429,13 @@ pub mod tests {
             admins: vec![admin_keys().public_key()],
             socks5: None,
             network: Network::Regtest,
-            backend: BackendConfig { kind, url: url.into(), secret: SECRET.into(), pin: None, timeout: Duration::from_secs(5) },
+            backend: BackendConfig {
+                kind,
+                url: url.into(),
+                secret: SECRET.into(),
+                pin: None,
+                timeout: Duration::from_secs(5),
+            },
             limits: Limits::default(),
             addresses,
             sources,
@@ -356,11 +444,19 @@ pub mod tests {
 
     pub fn caller(keys: &Keys) -> Caller {
         let event = EventBuilder::text_note("req").sign_with_keys(keys).unwrap();
-        Caller { pubkey: Some(keys.public_key().to_hex()), event: Some(event) }
+        Caller {
+            pubkey: Some(keys.public_key().to_hex()),
+            event: Some(event),
+        }
     }
 
     fn params(name: &str, msat: u64) -> MakeInvoiceParams {
-        MakeInvoiceParams { name: name.into(), domain: "pay.example".into(), amount_msat: msat, comment: None }
+        MakeInvoiceParams {
+            name: name.into(),
+            domain: "pay.example".into(),
+            amount_msat: msat,
+            comment: None,
+        }
     }
 
     async fn rig(kind: Kind) -> (Service, Arc<Fake>, tempfile::TempDir) {
@@ -390,7 +486,10 @@ pub mod tests {
             min_expiry: Duration::from_secs(60),
         };
         assert_eq!(bolt11::check(&made.pr, &want).unwrap().payment_hash, made.payment_hash);
-        assert_eq!(svc.list_addresses(&gw).unwrap().payee, Some(crate::bolt11::testutil::node_pubkey()));
+        assert_eq!(
+            svc.list_addresses(&gw).unwrap().payee,
+            Some(crate::bolt11::testutil::node_pubkey())
+        );
         assert_eq!(svc.config().backend.kind, Kind::Lnd);
     }
 
@@ -399,14 +498,27 @@ pub mod tests {
         let (svc, _fake, _dir) = rig(Kind::Phoenixd).await;
         let gw = caller(&gateway_keys());
         let e = |r: Result<MadeInvoice, Refusal>| r.unwrap_err();
-        assert_eq!(e(svc.make_invoice(&gw, params("nobody", 1000)).await).code, code::NOT_FOUND);
-        assert_eq!(e(svc.make_invoice(&gw, params("bob", 1000)).await).code, code::NOT_FOUND);
+        assert_eq!(
+            e(svc.make_invoice(&gw, params("nobody", 1000)).await).code,
+            code::NOT_FOUND
+        );
+        assert_eq!(
+            e(svc.make_invoice(&gw, params("bob", 1000)).await).code,
+            code::NOT_FOUND
+        );
         let mut bad_domain = params("alice", 1000);
         bad_domain.domain = "Bad Domain".into();
         assert_eq!(e(svc.make_invoice(&gw, bad_domain).await).code, code::NOT_FOUND);
-        assert!(e(svc.make_invoice(&gw, params("alice", 999)).await).message.contains("1000 to"));
-        assert_eq!(e(svc.make_invoice(&gw, params("alice", 2_000_000_000)).await).code, code::INVALID);
-        assert!(e(svc.make_invoice(&gw, params("alice", 1500)).await).message.contains("whole satoshis"));
+        assert!(e(svc.make_invoice(&gw, params("alice", 999)).await)
+            .message
+            .contains("1000 to"));
+        assert_eq!(
+            e(svc.make_invoice(&gw, params("alice", 2_000_000_000)).await).code,
+            code::INVALID
+        );
+        assert!(e(svc.make_invoice(&gw, params("alice", 1500)).await)
+            .message
+            .contains("whole satoshis"));
         let mut long = params("alice", 1000);
         long.comment = Some("x".repeat(11));
         assert!(e(svc.make_invoice(&gw, long).await).message.contains("at most 10"));
@@ -420,12 +532,24 @@ pub mod tests {
         let (svc, _fake, _dir) = rig(Kind::Lnd).await;
         let stranger = caller(&Keys::generate());
         assert_eq!(svc.list_addresses(&stranger).unwrap_err().code, code::UNAUTHORIZED);
-        assert_eq!(svc.list_addresses(&Caller::default()).unwrap_err().code, code::UNAUTHORIZED);
-        let bad_hex = Caller { pubkey: Some("zz".into()), event: None };
+        assert_eq!(
+            svc.list_addresses(&Caller::default()).unwrap_err().code,
+            code::UNAUTHORIZED
+        );
+        let bad_hex = Caller {
+            pubkey: Some("zz".into()),
+            event: None,
+        };
         assert_eq!(svc.list_addresses(&bad_hex).unwrap_err().code, code::UNAUTHORIZED);
         let keys = gateway_keys();
-        let old = EventBuilder::text_note("old").custom_created_at(Timestamp::from(1_000)).sign_with_keys(&keys).unwrap();
-        let stale = Caller { pubkey: Some(keys.public_key().to_hex()), event: Some(old) };
+        let old = EventBuilder::text_note("old")
+            .custom_created_at(Timestamp::from(1_000))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let stale = Caller {
+            pubkey: Some(keys.public_key().to_hex()),
+            event: Some(old),
+        };
         assert!(svc.list_addresses(&stale).unwrap_err().message.contains("timestamp"));
         let gw = caller(&gateway_keys());
         assert!(svc.status(&gw).unwrap_err().message.contains("admins only"));
@@ -433,7 +557,10 @@ pub mod tests {
         let p = proto::RemoveAddressParams { name: "alice".into() };
         assert!(svc.remove_address(&gw, p).is_err());
         // Without an event (a test transport) the key alone decides.
-        let bare = Caller { pubkey: Some(admin_keys().public_key().to_hex()), event: None };
+        let bare = Caller {
+            pubkey: Some(admin_keys().public_key().to_hex()),
+            event: None,
+        };
         assert!(svc.status(&bare).is_ok());
     }
 
@@ -448,7 +575,10 @@ pub mod tests {
         assert!(!r.message.contains("internals"));
         *fake.fail.lock().unwrap() = None;
         *fake.wrong_amount.lock().unwrap() = Some(1);
-        assert_eq!(svc.make_invoice(&gw, params("alice", 1000)).await.unwrap_err().code, code::BACKEND);
+        assert_eq!(
+            svc.make_invoice(&gw, params("alice", 1000)).await.unwrap_err().code,
+            code::BACKEND
+        );
         let st = svc.status(&admin).unwrap();
         assert_eq!((st.invoices_made, st.invoices_failed), (0, 2));
         assert!(st.last_error.unwrap().contains("refused"));
@@ -474,8 +604,14 @@ pub mod tests {
             tokio::spawn(async move { svc.make_invoice(&gw, params("alice", 1000)).await })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(svc.make_invoice(&gw, params("alice", 1000)).await.unwrap_err().code, code::RATE_LIMITED);
-        assert_eq!(svc.make_invoice(&admin, params("alice", 1000)).await.unwrap_err().code, code::BUSY);
+        assert_eq!(
+            svc.make_invoice(&gw, params("alice", 1000)).await.unwrap_err().code,
+            code::RATE_LIMITED
+        );
+        assert_eq!(
+            svc.make_invoice(&admin, params("alice", 1000)).await.unwrap_err().code,
+            code::BUSY
+        );
         assert_eq!(slow.await.unwrap().unwrap_err().code, code::BACKEND);
     }
 
@@ -497,16 +633,34 @@ pub mod tests {
         };
         let after = svc.set_address(&admin, set.clone()).unwrap();
         assert_eq!(after.addresses.len(), 3);
-        let bad = proto::SetAddressParams { name: "Bad".into(), ..set };
+        let bad = proto::SetAddressParams {
+            name: "Bad".into(),
+            ..set
+        };
         assert_eq!(svc.set_address(&admin, bad).unwrap_err().code, code::INVALID);
-        svc.remove_address(&admin, proto::RemoveAddressParams { name: "alice".into() }).unwrap();
-        let gone = svc.remove_address(&admin, proto::RemoveAddressParams { name: "alice".into() }).unwrap_err();
+        svc.remove_address(&admin, proto::RemoveAddressParams { name: "alice".into() })
+            .unwrap();
+        let gone = svc
+            .remove_address(&admin, proto::RemoveAddressParams { name: "alice".into() })
+            .unwrap_err();
         assert_eq!(gone.code, code::NOT_FOUND);
-        let limits = proto::SetLimitsParams { invoices_per_minute: Some(1), per_caller_per_minute: None, invoice_expiry_secs: None };
+        let limits = proto::SetLimitsParams {
+            invoices_per_minute: Some(1),
+            per_caller_per_minute: None,
+            invoice_expiry_secs: None,
+        };
         assert_eq!(svc.set_limits(&admin, limits).unwrap().limits.invoices_per_minute, 1);
-        let same = proto::SetLimitsParams { invoices_per_minute: None, per_caller_per_minute: None, invoice_expiry_secs: None };
+        let same = proto::SetLimitsParams {
+            invoices_per_minute: None,
+            per_caller_per_minute: None,
+            invoice_expiry_secs: None,
+        };
         svc.set_limits(&admin, same).unwrap();
-        let bad_limits = proto::SetLimitsParams { invoices_per_minute: None, per_caller_per_minute: None, invoice_expiry_secs: Some(5) };
+        let bad_limits = proto::SetLimitsParams {
+            invoices_per_minute: None,
+            per_caller_per_minute: None,
+            invoice_expiry_secs: Some(5),
+        };
         assert_eq!(svc.set_limits(&admin, bad_limits).unwrap_err().code, code::INVALID);
         let saved = config::read_remote(dir.path()).unwrap().unwrap();
         assert_eq!(saved.addresses.unwrap().keys().collect::<Vec<_>>(), ["bob", "carol"]);
@@ -531,11 +685,19 @@ pub mod tests {
         let rm = || proto::RemoveAddressParams { name: "alice".into() };
         assert_eq!(svc.remove_address(&admin, rm()).unwrap_err().code, code::LOCKED);
         let mut on = cfg;
-        on.sources.apply(&SourcesLayer { remote: Some(true), ..Default::default() });
+        on.sources.apply(&SourcesLayer {
+            remote: Some(true),
+            ..Default::default()
+        });
         on.data_dir = dir.path().join("missing");
         let svc = Service::new(on);
         assert_eq!(svc.remove_address(&admin, rm()).unwrap_err().code, code::INTERNAL);
-        assert!(svc.config_view(&admin).unwrap().addresses.iter().any(|a| a.name == "alice"));
+        assert!(svc
+            .config_view(&admin)
+            .unwrap()
+            .addresses
+            .iter()
+            .any(|a| a.name == "alice"));
     }
 
     #[test]
@@ -565,6 +727,8 @@ pub mod tests {
         .join();
         let admin = caller(&admin_keys());
         assert!(svc.list_addresses(&admin).is_ok());
-        assert!(svc.remove_address(&admin, proto::RemoveAddressParams { name: "alice".into() }).is_ok());
+        assert!(svc
+            .remove_address(&admin, proto::RemoveAddressParams { name: "alice".into() })
+            .is_ok());
     }
 }

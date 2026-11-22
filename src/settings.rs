@@ -36,14 +36,23 @@ impl Default for Sources {
     /// Files and the environment are read; remote settings are off until
     /// some layer switches them on.
     fn default() -> Self {
-        Sources { file: true, env: true, remote: false, locked: [false; 3] }
+        Sources {
+            file: true,
+            env: true,
+            remote: false,
+            locked: [false; 3],
+        }
     }
 }
 
 impl Sources {
     /// Apply one layer's switches.
     pub fn apply(&mut self, layer: &SourcesLayer) {
-        let slots = [(&mut self.file, layer.file), (&mut self.env, layer.env), (&mut self.remote, layer.remote)];
+        let slots = [
+            (&mut self.file, layer.file),
+            (&mut self.env, layer.env),
+            (&mut self.remote, layer.remote),
+        ];
         for (i, (value, wanted)) in slots.into_iter().enumerate() {
             match wanted {
                 Some(false) => {
@@ -59,7 +68,11 @@ impl Sources {
 
 /// `a, b ,c` as a list, skipping blanks.
 pub fn list(s: &str) -> Vec<String> {
-    s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
+    s.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// A yes/no environment value.
@@ -73,7 +86,9 @@ pub fn flag(name: &str, s: &str) -> Result<bool, String> {
 
 /// A number from the environment.
 pub fn number<T: std::str::FromStr>(name: &str, s: &str) -> Result<T, String> {
-    s.trim().parse().map_err(|_| format!("{name}: {s:?} is not a valid number"))
+    s.trim()
+        .parse()
+        .map_err(|_| format!("{name}: {s:?} is not a valid number"))
 }
 
 /// A Nostr public key given as npub or hex.
@@ -94,7 +109,9 @@ pub fn relay(s: &str) -> Result<String, String> {
     match url.scheme() {
         "wss" if !host.is_empty() => Ok(s.to_string()),
         "ws" if is_loopback_host(host) || is_overlay_host(host) => Ok(s.to_string()),
-        "ws" => Err(format!("relay {s:?} must use wss:// (ws:// is for loopback, .onion and .i2p only)")),
+        "ws" => Err(format!(
+            "relay {s:?} must use wss:// (ws:// is for loopback, .onion and .i2p only)"
+        )),
         _ => Err(format!("relay {s:?} must be a wss:// address")),
     }
 }
@@ -110,8 +127,12 @@ pub fn is_overlay_host(host: &str) -> bool {
 
 /// A SOCKS5 proxy for relay connections, as `host:port` or `socks5://host:port`.
 pub fn socks5(s: &str) -> Result<SocketAddr, String> {
-    let bare = s.trim().trim_start_matches("socks5h://").trim_start_matches("socks5://");
-    bare.parse().map_err(|_| format!("proxy {s:?} must be an IP address and port, e.g. 127.0.0.1:9050"))
+    let bare = s
+        .trim()
+        .trim_start_matches("socks5h://")
+        .trim_start_matches("socks5://");
+    bare.parse()
+        .map_err(|_| format!("proxy {s:?} must be an IP address and port, e.g. 127.0.0.1:9050"))
 }
 
 /// A secret is never printed: only whether it is set.
@@ -131,11 +152,22 @@ mod tests {
     fn a_source_switched_off_stays_off() {
         let mut s = Sources::default();
         assert!(s.file && s.env && !s.remote);
-        s.apply(&SourcesLayer { remote: Some(true), ..Default::default() });
+        s.apply(&SourcesLayer {
+            remote: Some(true),
+            ..Default::default()
+        });
         assert!(s.remote);
-        s.apply(&SourcesLayer { env: Some(false), remote: Some(false), file: None });
+        s.apply(&SourcesLayer {
+            env: Some(false),
+            remote: Some(false),
+            file: None,
+        });
         assert!(!s.env && !s.remote);
-        s.apply(&SourcesLayer { env: Some(true), remote: Some(true), file: Some(true) });
+        s.apply(&SourcesLayer {
+            env: Some(true),
+            remote: Some(true),
+            file: Some(true),
+        });
         assert!(!s.env && !s.remote && s.file);
     }
 
@@ -173,7 +205,9 @@ mod tests {
         assert!(relay("ws://abc.onion").is_ok());
         assert!(relay("ws://abc.i2p").is_ok());
         assert!(relay("ws://relay.example.com").unwrap_err().contains("must use wss://"));
-        assert!(relay("https://relay.example.com").unwrap_err().contains("must be a wss://"));
+        assert!(relay("https://relay.example.com")
+            .unwrap_err()
+            .contains("must be a wss://"));
         assert!(relay("wss://u:p@relay.example.com").unwrap_err().contains("user name"));
         assert!(relay("relay").unwrap_err().contains("not a URL"));
     }

@@ -3,6 +3,12 @@
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let shutdown = deadhop_lnaddr::shutdown_signal();
-    deadhop_lnaddr::node::app::command(&args, |k| std::env::var(k).ok(), shutdown, &mut std::io::stdout()).await
+    let shutdown = Box::pin(deadhop_lnaddr::shutdown_signal());
+    deadhop_lnaddr::node::app::command(
+        &args,
+        Box::new(|k| std::env::var(k).ok()),
+        shutdown,
+        &mut std::io::stdout(),
+    )
+    .await
 }

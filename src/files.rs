@@ -22,7 +22,10 @@ fn read_checked(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
         Err(e) => return Err(e),
     };
     if file.metadata()?.permissions().mode() & 0o077 != 0 {
-        return Err(std::io::Error::other(format!("readable by other users; run: chmod 600 {}", path.display())));
+        return Err(std::io::Error::other(format!(
+            "readable by other users; run: chmod 600 {}",
+            path.display()
+        )));
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -32,7 +35,9 @@ fn read_checked(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 /// The same for a text file.
 pub fn read_private(path: &Path) -> Result<Option<String>, String> {
     match read_private_bytes(path)? {
-        Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| format!("{} is not text", path.display())),
+        Some(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| format!("{} is not text", path.display())),
         None => Ok(None),
     }
 }
@@ -54,7 +59,12 @@ pub fn read_secret_text(path: &Path) -> Result<String, String> {
 pub fn write_private(path: &Path, content: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     let write = || -> std::io::Result<()> {
-        let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         fs::rename(&tmp, path)
@@ -68,7 +78,10 @@ pub fn load_or_create_keys(path: &Path) -> Result<Keys, String> {
         return Keys::parse(text.trim()).map_err(|_| format!("{} does not hold a nostr secret key", path.display()));
     }
     let keys = Keys::generate();
-    let nsec = keys.secret_key().to_bech32().expect("a valid secret key always encodes as bech32");
+    let nsec = keys
+        .secret_key()
+        .to_bech32()
+        .expect("a valid secret key always encodes as bech32");
     write_private(path, &format!("{nsec}\n"))?;
     Ok(keys)
 }

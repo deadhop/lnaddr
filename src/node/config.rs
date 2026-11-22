@@ -66,15 +66,27 @@ impl Address {
         if !lnurl::valid_name(name) {
             return e("names are 1 to 64 of a-z 0-9 - _ .".into());
         }
-        if self.min_sendable < lnurl::MIN_MSAT || self.min_sendable > self.max_sendable || self.max_sendable > lnurl::MAX_MSAT {
-            return e(format!("need 1 <= min_sendable <= max_sendable <= {} msat", lnurl::MAX_MSAT));
+        if self.min_sendable < lnurl::MIN_MSAT
+            || self.min_sendable > self.max_sendable
+            || self.max_sendable > lnurl::MAX_MSAT
+        {
+            return e(format!(
+                "need 1 <= min_sendable <= max_sendable <= {} msat",
+                lnurl::MAX_MSAT
+            ));
         }
         if kind.whole_sats() && self.min_sendable.div_ceil(1000) * 1000 > self.max_sendable {
-            return e(format!("{} takes whole satoshis, and no whole satoshi amount fits the range", kind.name()));
+            return e(format!(
+                "{} takes whole satoshis, and no whole satoshi amount fits the range",
+                kind.name()
+            ));
         }
         let len = self.description.chars().count();
         if len == 0 || len > lnurl::MAX_DESCRIPTION_LEN || self.description.chars().any(char::is_control) {
-            return e(format!("description must be 1 to {} printable characters", lnurl::MAX_DESCRIPTION_LEN));
+            return e(format!(
+                "description must be 1 to {} printable characters",
+                lnurl::MAX_DESCRIPTION_LEN
+            ));
         }
         if self.comment_allowed > lnurl::MAX_COMMENT_LEN {
             return e(format!("comment_allowed is at most {}", lnurl::MAX_COMMENT_LEN));
@@ -153,7 +165,12 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { invoices_per_minute: 120, per_caller_per_minute: 60, concurrent: 8, invoice_expiry_secs: 600 }
+        Limits {
+            invoices_per_minute: 120,
+            per_caller_per_minute: 60,
+            concurrent: 8,
+            invoice_expiry_secs: 600,
+        }
     }
 }
 
@@ -166,7 +183,11 @@ impl Limits {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.invoices_per_minute == 0 || self.per_caller_per_minute == 0 || self.concurrent == 0 || self.concurrent > 256 {
+        if self.invoices_per_minute == 0
+            || self.per_caller_per_minute == 0
+            || self.concurrent == 0
+            || self.concurrent > 256
+        {
             return Err("limits: rates must be at least 1 and concurrent 1 to 256".into());
         }
         if !(60..=86_400).contains(&self.invoice_expiry_secs) {
@@ -222,14 +243,28 @@ fn merge(a: &mut Layer, b: Layer) {
         macro_rules! takeb {
             ($($f:ident),*) => { $( if bb.$f.is_some() { ab.$f = bb.$f; } )* };
         }
-        takeb!(kind, url, secret, secret_file, tls_cert_sha256, tls_cert_file, timeout_secs, insecure_http);
+        takeb!(
+            kind,
+            url,
+            secret,
+            secret_file,
+            tls_cert_sha256,
+            tls_cert_file,
+            timeout_secs,
+            insecure_http
+        );
     }
     if let Some(bl) = b.limits {
         let al = a.limits.get_or_insert_with(Default::default);
         macro_rules! takel {
             ($($f:ident),*) => { $( if bl.$f.is_some() { al.$f = bl.$f; } )* };
         }
-        takel!(invoices_per_minute, per_caller_per_minute, concurrent, invoice_expiry_secs);
+        takel!(
+            invoices_per_minute,
+            per_caller_per_minute,
+            concurrent,
+            invoice_expiry_secs
+        );
     }
     if let Some(addrs) = b.addresses {
         a.addresses.get_or_insert_with(Default::default).extend(addrs);
@@ -273,8 +308,17 @@ fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
         network: get("NETWORK"),
         backend: Some(backend),
         limits: None,
-        addresses: get("ADDRESSES").map(|v| settings::list(&v).into_iter().map(|n| (n.clone(), Address::default_for(&n))).collect()),
-        sources: Some(SourcesLayer { file: None, env: None, remote }),
+        addresses: get("ADDRESSES").map(|v| {
+            settings::list(&v)
+                .into_iter()
+                .map(|n| (n.clone(), Address::default_for(&n)))
+                .collect()
+        }),
+        sources: Some(SourcesLayer {
+            file: None,
+            env: None,
+            remote,
+        }),
     })
 }
 
@@ -313,7 +357,10 @@ fn layers(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> Res
 /// Just the data directory, for commands that need nothing else. Falls back
 /// to the default when the configuration cannot be read.
 pub fn data_dir_only(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    layers(builtin, lookup).ok().and_then(|(l, _)| l.data_dir).unwrap_or_else(|| default_data_dir(lookup))
+    layers(builtin, lookup)
+        .ok()
+        .and_then(|(l, _)| l.data_dir)
+        .unwrap_or_else(|| default_data_dir(lookup))
 }
 
 /// Load and check the configuration. `builtin` is the compiled-in layer;
@@ -327,7 +374,13 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
                 layer.addresses = Some(a);
             }
             if let Some(l) = remote.limits {
-                merge(&mut layer, Layer { limits: Some(l), ..Default::default() });
+                merge(
+                    &mut layer,
+                    Layer {
+                        limits: Some(l),
+                        ..Default::default()
+                    },
+                );
             }
         }
     }
@@ -338,7 +391,9 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
 pub fn read_remote(data_dir: &Path) -> Result<Option<Remote>, String> {
     let path = data_dir.join(REMOTE_FILE);
     match crate::files::read_private(&path)? {
-        Some(text) => toml::from_str(&text).map(Some).map_err(|e| format!("{}: {}", path.display(), e.message())),
+        Some(text) => toml::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {}", path.display(), e.message())),
         None => Ok(None),
     }
 }
@@ -349,7 +404,10 @@ pub fn write_remote(data_dir: &Path, remote: &Remote) -> Result<(), String> {
 }
 
 fn keys(what: &str, list: Option<Vec<String>>) -> Result<Vec<PublicKey>, String> {
-    list.unwrap_or_default().iter().map(|k| settings::pubkey(k).map_err(|e| format!("{what}: {e}"))).collect()
+    list.unwrap_or_default()
+        .iter()
+        .map(|k| settings::pubkey(k).map_err(|e| format!("{what}: {e}")))
+        .collect()
 }
 
 /// Whether plain http to `host` keeps the credential on this machine or
@@ -367,14 +425,22 @@ pub fn local_host(host: &str) -> bool {
 }
 
 fn backend(b: BackendLayer) -> Result<BackendConfig, String> {
-    let kind: Kind = b.kind.as_deref().ok_or("backend: set backend.kind (lnd, cln, phoenixd or lnbits)")?.parse()?;
+    let kind: Kind = b
+        .kind
+        .as_deref()
+        .ok_or("backend: set backend.kind (lnd, cln, phoenixd or lnbits)")?
+        .parse()?;
     let url = b.url.unwrap_or_else(|| kind.default_url().to_string());
     let parsed = reqwest::Url::parse(&url).map_err(|_| format!("backend: {url:?} is not a URL"))?;
     let host = parsed.host_str().unwrap_or("").to_string();
     match parsed.scheme() {
         "https" => {}
         "http" if local_host(&host) || b.insecure_http == Some(true) => {}
-        "http" => return Err(format!("backend: {url} sends the credential in the clear to a public host; use https or set backend.insecure_http")),
+        "http" => {
+            return Err(format!(
+            "backend: {url} sends the credential in the clear to a public host; use https or set backend.insecure_http"
+        ))
+        }
         other => return Err(format!("backend: {other}:// is not supported (http or https)")),
     }
     let secret = match (b.secret, b.secret_file) {
@@ -386,16 +452,26 @@ fn backend(b: BackendLayer) -> Result<BackendConfig, String> {
         (Some(p), _) => Some(crate::tls::parse_pin(&p).map_err(|e| format!("backend: {e}"))?),
         (None, Some(path)) => {
             let pem = std::fs::read_to_string(&path).map_err(|e| format!("backend: {}: {e}", path.display()))?;
-            Some(crate::tls::fingerprint(&crate::tls::first_pem_cert(&pem).map_err(|e| format!("backend: {e}"))?))
+            Some(crate::tls::fingerprint(
+                &crate::tls::first_pem_cert(&pem).map_err(|e| format!("backend: {e}"))?,
+            ))
         }
         (None, None) => None,
     };
     let timeout = Duration::from_secs(b.timeout_secs.unwrap_or(10).clamp(1, 60));
-    Ok(BackendConfig { kind, url, secret, pin, timeout })
+    Ok(BackendConfig {
+        kind,
+        url,
+        secret,
+        pin,
+        timeout,
+    })
 }
 
 fn finish(layer: Layer, data_dir: PathBuf, sources: Sources) -> Result<Config, String> {
-    let relays = layer.relays.unwrap_or_else(|| DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect());
+    let relays = layer
+        .relays
+        .unwrap_or_else(|| DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect());
     if relays.is_empty() {
         return Err("relays: at least one relay is needed".into());
     }
@@ -419,7 +495,18 @@ fn finish(layer: Layer, data_dir: PathBuf, sources: Sources) -> Result<Config, S
     for (name, a) in &addresses {
         a.validate(name, backend.kind)?;
     }
-    Ok(Config { data_dir, relays, gateways, admins, socks5, network, backend, limits, addresses, sources })
+    Ok(Config {
+        data_dir,
+        relays,
+        gateways,
+        admins,
+        socks5,
+        network,
+        backend,
+        limits,
+        addresses,
+        sources,
+    })
 }
 
 #[cfg(test)]
@@ -464,7 +551,10 @@ pub mod tests {
         assert!(!format!("{:?}", c.backend).contains("pw"));
         let mut with_home = minimal();
         with_home.push(("HOME", "/home/u".into()));
-        assert_eq!(load_pairs(None, &with_home).unwrap().data_dir, Path::new("/home/u/.local/share/deadhop-lnaddr/node"));
+        assert_eq!(
+            load_pairs(None, &with_home).unwrap().data_dir,
+            Path::new("/home/u/.local/share/deadhop-lnaddr/node")
+        );
     }
 
     #[test]
@@ -561,7 +651,10 @@ description = "Only"
         addrs.insert("zed".to_string(), Address::default_for("zed"));
         let remote = Remote {
             addresses: Some(addrs),
-            limits: Some(LimitsLayer { invoices_per_minute: Some(7), ..Default::default() }),
+            limits: Some(LimitsLayer {
+                invoices_per_minute: Some(7),
+                ..Default::default()
+            }),
         };
         write_remote(dir.path(), &remote).unwrap();
         assert_eq!(read_remote(dir.path()).unwrap().unwrap(), remote);
@@ -580,7 +673,14 @@ description = "Only"
         assert!(load_pairs(None, &fresh).unwrap().addresses.contains_key("alice"));
         assert_eq!(read_remote(empty.path()).unwrap(), None);
         // Only limits saved: addresses stay as configured.
-        write_remote(dir.path(), &Remote { addresses: None, limits: None }).unwrap();
+        write_remote(
+            dir.path(),
+            &Remote {
+                addresses: None,
+                limits: None,
+            },
+        )
+        .unwrap();
         assert!(load_pairs(None, &pairs).unwrap().addresses.contains_key("alice"));
         // A remote file that tries to change anything else is refused.
         std::fs::write(dir.path().join(REMOTE_FILE), "[backend]\nurl = \"https://evil\"\n").unwrap();
@@ -602,7 +702,11 @@ description = "Only"
             ("LNADDR_NODE_BACKEND_URL", "http://lnbits.example.com", "in the clear"),
             ("LNADDR_NODE_BACKEND_URL", "ftp://10.0.0.1", "ftp:// is not supported"),
             ("LNADDR_NODE_BACKEND_TLS_CERT_SHA256", "zz", "not a hex"),
-            ("LNADDR_NODE_BACKEND_TLS_CERT_FILE", "/does/not/exist", "/does/not/exist"),
+            (
+                "LNADDR_NODE_BACKEND_TLS_CERT_FILE",
+                "/does/not/exist",
+                "/does/not/exist",
+            ),
             ("LNADDR_NODE_BACKEND_TIMEOUT_SECS", "soon", "not a valid number"),
             ("LNADDR_NODE_BACKEND_INSECURE_HTTP", "maybe", "not on or off"),
             ("LNADDR_NODE_REMOTE", "maybe", "not on or off"),
@@ -621,11 +725,17 @@ description = "Only"
         assert!(load_pairs(None, &no_kind).unwrap_err().contains("set backend.kind"));
         let mut no_secret = minimal();
         no_secret.retain(|(k, _)| *k != "LNADDR_NODE_BACKEND_SECRET");
-        assert!(load_pairs(None, &no_secret).unwrap_err().contains("set backend.secret_file"));
+        assert!(load_pairs(None, &no_secret)
+            .unwrap_err()
+            .contains("set backend.secret_file"));
         no_secret.push(("LNADDR_NODE_BACKEND_SECRET_FILE", "/does/not/exist".into()));
         assert!(load_pairs(None, &no_secret).unwrap_err().contains("does not exist"));
-        assert!(load_pairs(Some("nonsense = 1"), &minimal()).unwrap_err().contains("built-in configuration: unknown field"));
-        assert!(load_pairs(Some("[limits]\nconcurrent = 0"), &minimal()).unwrap_err().contains("concurrent 1 to 256"));
+        assert!(load_pairs(Some("nonsense = 1"), &minimal())
+            .unwrap_err()
+            .contains("built-in configuration: unknown field"));
+        assert!(load_pairs(Some("[limits]\nconcurrent = 0"), &minimal())
+            .unwrap_err()
+            .contains("concurrent 1 to 256"));
         let dir = tempfile::tempdir().unwrap();
         let bad_pem = dir.path().join("tls.cert");
         std::fs::write(&bad_pem, "junk").unwrap();
@@ -659,7 +769,10 @@ description = "Only"
     #[test]
     fn the_data_directory_is_found_without_a_full_configuration() {
         assert_eq!(data_dir_only(Some("data_dir = \"/x\""), &env(&[])), Path::new("/x"));
-        assert_eq!(data_dir_only(Some("junk"), &env(&[("HOME", "/h")])), Path::new("/h/.local/share/deadhop-lnaddr/node"));
+        assert_eq!(
+            data_dir_only(Some("junk"), &env(&[("HOME", "/h")])),
+            Path::new("/h/.local/share/deadhop-lnaddr/node")
+        );
     }
 
     #[test]
@@ -675,23 +788,51 @@ description = "Only"
         bad(&|a| a.min_sendable = 0, Kind::Lnd, "min_sendable");
         bad(&|a| a.min_sendable = a.max_sendable + 1, Kind::Lnd, "min_sendable");
         bad(&|a| a.max_sendable = lnurl::MAX_MSAT + 1, Kind::Lnd, "min_sendable");
-        bad(&|a| { a.min_sendable = 1500; a.max_sendable = 1900 }, Kind::Phoenixd, "whole satoshis");
+        bad(
+            &|a| {
+                a.min_sendable = 1500;
+                a.max_sendable = 1900
+            },
+            Kind::Phoenixd,
+            "whole satoshis",
+        );
         bad(&|a| a.description.clear(), Kind::Lnd, "description");
         bad(&|a| a.description = "x".repeat(641), Kind::Lnd, "description");
         bad(&|a| a.description = "tab\there".into(), Kind::Lnd, "description");
         bad(&|a| a.comment_allowed = 2001, Kind::Lnd, "comment_allowed");
-        bad(&|a| a.domains = vec!["Example.com".into()], Kind::Lnd, "not a lower-case domain");
+        bad(
+            &|a| a.domains = vec!["Example.com".into()],
+            Kind::Lnd,
+            "not a lower-case domain",
+        );
         let mut sub_sat = Address::default_for("a");
         sub_sat.min_sendable = 1500;
         sub_sat.max_sendable = 1900;
         assert!(sub_sat.validate("a", Kind::Lnd).is_ok());
-        let e = Limits { invoice_expiry_secs: 10, ..Limits::default() }.validate().unwrap_err();
+        let e = Limits {
+            invoice_expiry_secs: 10,
+            ..Limits::default()
+        }
+        .validate()
+        .unwrap_err();
         assert!(e.contains("60 to 86400"));
     }
 
     #[test]
     fn only_local_hosts_may_get_the_credential_in_the_clear() {
-        for local in ["127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.1.1", "[::1]", "[fd00::1]", "phoenixd", "node.local", "lnd.internal", "abc.onion"] {
+        for local in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "[::1]",
+            "[fd00::1]",
+            "phoenixd",
+            "node.local",
+            "lnd.internal",
+            "abc.onion",
+        ] {
             assert!(local_host(local), "{local}");
         }
         for public in ["8.8.8.8", "[2001:db8::1]", "lnbits.example.com"] {
