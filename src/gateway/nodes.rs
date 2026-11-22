@@ -404,3 +404,64 @@ impl Directory {
 pub async fn futures_join_all<F: std::future::Future<Output = ()>>(fs: impl Iterator<Item = F>) {
     futures_util::future::join_all(fs).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_keep_bounded_history() {
+        let m = Metrics::default();
+        assert_eq!(m.view().p50_ms, None);
+        for ms in 0..250 {
+            m.latency(ms);
+        }
+        for i in 0..25 {
+            m.failed(format!("f{i}"));
+        }
+        let v = m.view();
+        assert_eq!((v.p50_ms, v.p95_ms), (Some(150), Some(239)));
+        assert_eq!(v.recent_failures.len(), 20);
+        assert_eq!(v.recent_failures[0].1, "f24");
+        assert_eq!(v.failures, 25);
+    }
+
+    #[tokio::test]
+    async fn a_link_without_a_client_reports_no_relays() {
+        let cfg = NodeConfig { pubkey: Keys::generate().public_key(), names: None, relays: vec!["ws://127.0.0.1:9".into()], payee: None };
+        let link = NodeLink::new(cfg, Keys::generate(), None, Duration::from_secs(1));
+        let h = link.health().await;
+        assert_eq!((h.relays_connected, h.reachable, h.addresses), (0, false, 0));
+        assert!(link.addresses().is_empty());
+        link.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_whose_connection_died_is_rebuilt() {
+        let s = crate::gateway::tests::stack().await;
+        let link = &s.gw().dir.nodes[0];
+        let client = link.client().await.unwrap();
+        client.service_token().cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client);
+        let list: AddressList = link.call(proto::LIST_ADDRESSES, json!({})).await.unwrap();
+        assert_eq!(list.addresses.len(), 2);
+        s.stop().await;
+    }
+
+    #[test]
+    fn poisoned_locks_are_survived() {
+        let m = Arc::new(Mutex::new(1));
+        let rw = Arc::new(RwLock::new(2));
+        let (m2, rw2) = (m.clone(), rw.clone());
+        let _ = std::thread::spawn(move || {
+            let _a = m2.lock().unwrap();
+            let _b = rw2.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert_eq!(*lock(&m), 1);
+        assert_eq!(*read(&rw), 2);
+        assert_eq!(*write(&rw), 2);
+    }
+}

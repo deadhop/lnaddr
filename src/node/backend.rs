@@ -279,9 +279,12 @@ pub mod testutil {
     /// Serve the fake over TLS with a fresh self-signed certificate; returns
     /// its base URL and the certificate (DER and PEM).
     pub async fn serve_tls(fake: Arc<Fake>) -> (String, crate::tls::testutil::SelfSigned) {
+        serve_with(fake, crate::tls::testutil::self_signed()).await
+    }
+
+    pub async fn serve_with(fake: Arc<Fake>, cert: crate::tls::testutil::SelfSigned) -> (String, crate::tls::testutil::SelfSigned) {
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use hyper_util::service::TowerToHyperService;
-        let cert = crate::tls::testutil::self_signed();
         let acceptor = cert.acceptor.clone();
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("https://localhost:{}", l.local_addr().unwrap().port());
@@ -365,6 +368,10 @@ mod tests {
         assert!(wrong.create_invoice(&req(5_000)).await.unwrap_err().contains("unreachable"));
         let roots = Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(5));
         assert!(roots.create_invoice(&req(5_000)).await.is_err());
+        // An older backend that only speaks TLS 1.2.
+        let (url12, cert12) = serve_with(Arc::new(Fake::default()), crate::tls::testutil::self_signed_tls12()).await;
+        let old = Backend::new(Kind::Cln, &url12, SECRET.into(), Some(crate::tls::fingerprint(&cert12.der)), Duration::from_secs(5));
+        check(&old.create_invoice(&req(5_000)).await.unwrap(), 5_000);
     }
 
     #[tokio::test]

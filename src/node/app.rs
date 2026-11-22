@@ -25,7 +25,7 @@ pub struct Running {
     pub svc: Arc<Service>,
     pool: Arc<Pool>,
     cancel: CancellationToken,
-    task: JoinHandle<String>,
+    task: JoinHandle<Result<String, String>>,
 }
 
 /// Bring the node up: identity, relay connections and the request loop.
@@ -50,17 +50,15 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
         .with_server_info(ServerInfo::default().with_name("deadhop lnaddr node".to_string()));
     let transport = NostrServerTransport::with_relay_pool(transport_config, pool.clone())
         .await
-        .map_err(|e| format!("cannot start the ContextVM server: {e}"))?;
+        .map_err(crate::why)?;
     let transport = LocalHandshake::new(IntoTransport::<RoleServer, _, _>::into_transport(transport));
     let svc = Arc::new(Service::new(cfg));
     let cancel = CancellationToken::new();
     let task = tokio::spawn({
         let (server, cancel) = (NodeServer::new(svc.clone()), cancel.clone());
         async move {
-            match server.serve_with_ct(transport, cancel).await {
-                Ok(running) => format!("{:?}", running.waiting().await),
-                Err(e) => e.to_string(),
-            }
+            let running = server.serve_with_ct(transport, cancel).await.map_err(crate::why)?;
+            Ok::<String, String>(format!("{:?}", running.waiting().await))
         }
     });
     Ok(Running { keys, svc, pool, cancel, task })
@@ -75,7 +73,7 @@ impl Running {
     pub async fn until(mut self, shutdown: impl Future<Output = ()>) -> Result<(), String> {
         let outcome = tokio::select! {
             _ = shutdown => Ok(()),
-            why = &mut self.task => Err(format!("the request loop ended: {}", why.unwrap_or_else(|e| e.to_string()))),
+            why = &mut self.task => Err(format!("the request loop ended: {}", match why { Ok(Ok(s) | Err(s)) => s, Err(e) => e.to_string() })),
         };
         self.cancel.cancel();
         if !self.task.is_finished() {
@@ -401,15 +399,21 @@ pub mod tests {
         let bad_dir = file.join("data");
         let lookup = move |k: &str| (k == "LNADDR_NODE_DATA_DIR").then(|| bad_dir.display().to_string());
         let mut out = Vec::new();
-        assert_eq!(command(&["pubkey".to_string()], lookup.clone(), async {}, &mut out).await, ExitCode::FAILURE);
+        assert_eq!(command(&["pubkey".to_string()], lookup.clone(), std::future::ready(()), &mut out).await, ExitCode::FAILURE);
         let mut out = Vec::new();
-        assert_eq!(command(&[], lookup, async {}, &mut out).await, ExitCode::FAILURE);
+        assert_eq!(command(&[], lookup, std::future::ready(()), &mut out).await, ExitCode::FAILURE);
         assert!(String::from_utf8(out).unwrap().contains("lnaddr-node:"));
         // A valid configuration whose data directory cannot be made.
         let r = node_rig(Kind::Lnd).await;
         let mut cfg = r.cfg.clone();
         cfg.data_dir = file.join("data");
         assert!(start(cfg).await.is_err());
+        // A pinned backend says so in the summary.
+        let mut pinned = r.cfg.clone();
+        pinned.backend.pin = Some([0xab; 32]);
+        let mut out = Vec::new();
+        print_check(&pinned, &mut out);
+        assert!(String::from_utf8(out).unwrap().contains("pinned abababababababab…"));
         // No addresses: check says so.
         let mut cfg = r.cfg.clone();
         cfg.addresses.clear();

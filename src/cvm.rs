@@ -71,9 +71,15 @@ impl NodeClient {
             .with_oversized_enabled(false);
         let transport = NostrClientTransport::with_relay_pool(config, pool.clone())
             .await
-            .map_err(|e| format!("cannot reach the relays: {e}"))?;
-        let service = ().serve(transport).await.map_err(|e| format!("cannot start the ContextVM client: {e}"))?;
+            .map_err(crate::why)?;
+        let service = ().serve(transport).await.map_err(crate::why)?;
         Ok(NodeClient { service, pool, timeout })
+    }
+
+    /// Cancelling this ends the client, as a dead relay connection would.
+    #[cfg(test)]
+    pub fn service_token(&self) -> rmcp::service::RunningServiceCancellationToken {
+        self.service.cancellation_token()
     }
 
     /// How many relays are connected.
@@ -93,7 +99,6 @@ impl NodeClient {
                 let code = e.data.as_ref().and_then(|d| d.get("code")).and_then(Value::as_str).unwrap_or("error");
                 return Err(CallError::Refused { code: code.to_string(), message: e.message.to_string() });
             }
-            Ok(Err(ServiceError::Timeout { .. })) => return Err(CallError::Timeout),
             Ok(Err(e)) => return Err(CallError::Closed(e.to_string())),
             Ok(Ok(r)) => r,
         };
@@ -102,7 +107,7 @@ impl NodeClient {
             let message = result.content.iter().find_map(|c| c.as_text().map(|t| t.text.clone())).unwrap_or_default();
             return Err(CallError::Refused { code: crate::proto::code::INVALID.into(), message });
         }
-        let value = result.structured_content.ok_or_else(|| CallError::Bad("no structured content".into()))?;
+        let value = result.structured_content.ok_or(CallError::Bad("no structured content".into()))?;
         serde_json::from_value(value).map_err(|e| CallError::Bad(e.to_string()))
     }
 
@@ -115,6 +120,17 @@ impl NodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_closed_client_says_so() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let c = NodeClient::connect(Keys::generate(), &Keys::generate().public_key(), &[url], None, Duration::from_secs(2)).await.unwrap();
+        c.service.cancellation_token().cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let e = c.call::<Value>("anything", Value::Null).await.unwrap_err();
+        assert!(matches!(e, CallError::Closed(_)), "{e:?}");
+    }
 
     #[test]
     fn errors_read_well() {

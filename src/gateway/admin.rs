@@ -228,10 +228,7 @@ impl Admin {
 
     /// The session's CSRF token, if the request carries a live session.
     fn session(&self, headers: &HeaderMap) -> Option<String> {
-        let cookie = headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|c| {
-            let (k, v) = c.trim().split_once('=')?;
-            (k == COOKIE).then(|| v.to_string())
-        })?;
+        let cookie = session_cookie(headers)?;
         let mut s = self.sessions();
         match s.get(&cookie) {
             Some(sess) if sess.expires > Instant::now() => Some(sess.csrf.clone()),
@@ -552,17 +549,17 @@ async fn post_login(State(a): St, Extension(peer): Extension<Peer>, Form(f): For
     r
 }
 
+/// The session id in the request's cookies.
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|c| {
+        let (k, v) = c.trim().split_once('=')?;
+        (k == COOKIE).then(|| v.to_string())
+    })
+}
+
 async fn post_logout(State(a): St, headers: HeaderMap) -> Response {
-    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-        let mut s = a.sessions();
-        for part in cookie.split(';') {
-            if let Some((k, v)) = part.trim().split_once('=') {
-                if k == COOKIE {
-                    s.remove(v);
-                }
-            }
-        }
-    }
+    let id = session_cookie(&headers).unwrap_or_default();
+    a.sessions().remove(&id);
     let mut r = redirect("/login");
     r.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("lnaddr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"));
     r
@@ -650,4 +647,69 @@ pub fn router(a: Arc<Admin>) -> Router {
         .route("/assets/{file}", get(asset))
         .fallback(not_found)
         .with_state(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::config::NodeConfig;
+
+    fn admin() -> Admin {
+        let node = NodeConfig { pubkey: nostr_sdk::Keys::generate().public_key(), names: None, relays: vec!["ws://127.0.0.1:9".into()], payee: None };
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::gateway::tests::gateway_config_for(vec![node], dir.path());
+        cfg.limits.timeout = Duration::from_secs(1);
+        let d = Arc::new(Directory::new(cfg.nodes.clone(), nostr_sdk::Keys::generate(), None, cfg.limits.timeout));
+        Admin::new(cfg, d, "t".into(), None)
+    }
+
+    fn with_cookie(id: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_str(&format!("{COOKIE}={id}")).unwrap());
+        h
+    }
+
+    #[test]
+    fn text_is_escaped_and_numbers_read_well() {
+        assert_eq!(esc("<a href=\"x\">&'</a>"), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;");
+        assert_eq!(short("npub1abc"), "npub1abc");
+        assert_eq!(short(&format!("npub1{}", "q".repeat(58))), format!("npub1qqqqqqq…{}", "q".repeat(6)));
+        assert_eq!(sats(1_234_567_000), "1,234,567");
+        assert_eq!(sats(1_500), "1.500");
+        assert_eq!(ago(None), "never");
+        assert_eq!(ago(Some(5)), "5s ago");
+        assert_eq!(ago(Some(125)), "2m ago");
+        assert_eq!(ago(Some(7300)), "2h ago");
+        assert!(same("abc", "abc") && !same("abc", "abd") && !same("abc", "ab"));
+    }
+
+    #[test]
+    fn sessions_expire_and_the_oldest_gives_way() {
+        let a = admin();
+        a.sessions().insert("old".into(), Session { csrf: "c".into(), expires: Instant::now() - Duration::from_secs(1) });
+        assert_eq!(a.session(&with_cookie("old")), None);
+        assert!(a.sessions().is_empty(), "an expired session is forgotten");
+        assert_eq!(a.session(&with_cookie("unknown")), None);
+        assert_eq!(a.session(&HeaderMap::new()), None);
+        let now = Instant::now() + Duration::from_secs(60);
+        for i in 0..MAX_SESSIONS {
+            a.sessions().insert(format!("s{i}"), Session { csrf: "c".into(), expires: now + Duration::from_secs(i as u64) });
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let a = Arc::new(a);
+        let r = rt.block_on(post_login(State(a.clone()), Extension(Peer(None)), Form(LoginForm { token: "t".into() })));
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        let s = a.sessions();
+        assert_eq!(s.len(), MAX_SESSIONS);
+        assert!(!s.contains_key("s0"), "the session closest to expiry was dropped");
+    }
+
+    #[tokio::test]
+    async fn a_node_never_heard_from_waits_and_shows_no_addresses() {
+        let a = admin();
+        let page = a.overview().await;
+        assert!(page.contains("dot wait") && page.contains("No addresses yet"), "{page}");
+        assert!(a.address_table(vec![], None, 0).contains("None."));
+        assert!(a.change(0, proto::SET_LIMITS, json!({})).await.unwrap_err().contains("no admin key"));
+    }
 }

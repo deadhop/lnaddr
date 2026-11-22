@@ -25,6 +25,11 @@ pub struct Stack {
 }
 
 pub fn gateway_config(r: &NodeRig, node: &Keys, data: &std::path::Path) -> Config {
+    let nodes = vec![NodeConfig { pubkey: node.public_key(), names: None, relays: vec![r.relay_url.clone()], payee: None }];
+    gateway_config_for(nodes, data)
+}
+
+pub fn gateway_config_for(nodes: Vec<NodeConfig>, data: &std::path::Path) -> Config {
     Config {
         data_dir: data.to_path_buf(),
         listen: Listen::Tcp("127.0.0.1:0".parse().unwrap()),
@@ -32,7 +37,7 @@ pub fn gateway_config(r: &NodeRig, node: &Keys, data: &std::path::Path) -> Confi
         scheme_override: Some("http".into()),
         trusted_proxies: vec![],
         socks5: None,
-        nodes: vec![NodeConfig { pubkey: node.public_key(), names: None, relays: vec![r.relay_url.clone()], payee: None }],
+        nodes,
         limits: Limits {
             per_ip_per_minute: 1000,
             global_per_minute: 1000,
@@ -466,8 +471,13 @@ async fn the_admin_signs_in_and_changes_addresses_on_the_node() {
     for want in ["Serving.", "alice@pay.example", "Invoices", "Nodes", "None."] {
         assert!(p.body.contains(want), "{want}");
     }
+    // A failed invoice shows up as the node's last error.
+    *s.node_rig.fake.fail.lock().unwrap() = Some((500, "flat tyre".into()));
+    let _ = s.get("/.well-known/lnurlp/alice/callback?amount=1000").await;
+    *s.node_rig.fake.fail.lock().unwrap() = None;
     let p = b.get("/nodes/0").await;
     assert!(p.body.contains("Status") && p.body.contains("Add an address") && p.body.contains("lnd"), "{}", p.body);
+    assert!(p.body.contains("Last error: the lnd backend answered 500: flat tyre"), "{}", p.body);
     let csrf = Browser::csrf(&p.body);
 
     let add = [("csrf", csrf.as_str()), ("name", "carol"), ("min_sats", "1"), ("max_sats", "50,000"), ("description", "Carol's tips"), ("comment_allowed", "20"), ("domains", "")];
@@ -636,6 +646,7 @@ async fn the_command_line_tests_addresses_and_manages_nodes() {
         (vec!["test", "Bad Name"], "not a valid name"),
         (vec!["test", "alice@other.example"], "not one of this gateway's domains"),
         (vec!["test", "nobody"], "no such Lightning address"),
+        (vec!["test", "alice", "999999999"], "amount must be"),
     ] {
         let (code, out) = run(&env, &args).await;
         assert_eq!(code, ExitCode::FAILURE, "{args:?}");

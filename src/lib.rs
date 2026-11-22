@@ -16,6 +16,11 @@ pub mod ratelimit;
 pub mod settings;
 pub mod tls;
 
+/// An error as text, for errors that are passed on rather than handled.
+pub fn why(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -36,5 +41,14 @@ pub fn shutdown_signal() -> impl std::future::Future<Output = ()> {
             _ = term.recv() => {}
             _ = int.recv() => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn errors_become_text() {
+        assert_eq!(super::why(std::io::Error::other("boom")), "boom");
+        assert!(super::unix_now() > 1_700_000_000);
     }
 }

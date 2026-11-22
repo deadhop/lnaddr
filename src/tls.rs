@@ -122,12 +122,22 @@ pub mod testutil {
     }
 
     pub fn self_signed() -> SelfSigned {
+        build(false)
+    }
+
+    /// The same, speaking TLS 1.2 only.
+    pub fn self_signed_tls12() -> SelfSigned {
+        build(true)
+    }
+
+    fn build(tls12_only: bool) -> SelfSigned {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
         let der = cert.cert.der().to_vec();
         let key = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let versions: &[&rustls::SupportedProtocolVersion] = if tls12_only { &[&rustls::version::TLS12] } else { rustls::DEFAULT_VERSIONS };
         let config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(versions)
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![der.clone().into()], key)

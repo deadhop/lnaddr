@@ -344,7 +344,7 @@ pub fn read_remote(data_dir: &Path) -> Result<Option<Remote>, String> {
 }
 
 pub fn write_remote(data_dir: &Path, remote: &Remote) -> Result<(), String> {
-    let text = toml::to_string(remote).map_err(|e| e.to_string())?;
+    let text = toml::to_string(remote).expect("remote settings always serialise to TOML");
     crate::files::write_private(&data_dir.join(REMOTE_FILE), &text)
 }
 
@@ -572,6 +572,13 @@ description = "Only"
         assert!(on.sources.remote);
         assert_eq!(on.addresses.keys().collect::<Vec<_>>(), ["zed"]);
         assert_eq!(on.limits.invoices_per_minute, 7);
+        // Nothing saved yet: the configured values stand.
+        let empty = tempfile::tempdir().unwrap();
+        let mut fresh = pairs.clone();
+        fresh.retain(|(k, _)| *k != "LNADDR_NODE_DATA_DIR");
+        fresh.push(("LNADDR_NODE_DATA_DIR", empty.path().display().to_string()));
+        assert!(load_pairs(None, &fresh).unwrap().addresses.contains_key("alice"));
+        assert_eq!(read_remote(empty.path()).unwrap(), None);
         // Only limits saved: addresses stay as configured.
         write_remote(dir.path(), &Remote { addresses: None, limits: None }).unwrap();
         assert!(load_pairs(None, &pairs).unwrap().addresses.contains_key("alice"));

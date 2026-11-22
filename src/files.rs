@@ -12,20 +12,21 @@ use nostr_sdk::prelude::{Keys, ToBech32};
 /// exist. Permissions are read from the open handle, so the file that is
 /// checked is the file that is read.
 pub fn read_private_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    let shown = path.display();
-    match fs::File::open(path) {
-        Ok(mut file) => {
-            let mode = file.metadata().map_err(|e| format!("{shown}: {e}"))?.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(format!("{shown} is readable by other users; run: chmod 600 {shown}"));
-            }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|e| format!("{shown}: {e}"))?;
-            Ok(Some(bytes))
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{shown}: {e}")),
+    read_checked(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn read_checked(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(format!("readable by other users; run: chmod 600 {}", path.display())));
     }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 /// The same for a text file.
@@ -127,10 +128,8 @@ mod tests {
         let path = dir.path().join("locked");
         write_private(&path, "x").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        // Root can read anything; everyone else gets an error naming the file.
-        if let Err(e) = read_private(&path) {
-            assert!(e.contains("locked"));
-        }
+        // (The tests do not run as root, who could read it anyway.)
+        assert!(read_private(&path).unwrap_err().contains("locked"));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
