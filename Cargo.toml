@@ -1,0 +1,51 @@
+[package]
+name = "deadhop-lnaddr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Lightning addresses (LUD-16) for a node behind NAT: a public gateway asks the node for invoices over ContextVM"
+license = "MIT"
+default-run = "lnaddr-gateway"
+
+[[bin]]
+name = "lnaddr-node"
+path = "src/bin/lnaddr-node.rs"
+
+[[bin]]
+name = "lnaddr-gateway"
+path = "src/bin/lnaddr-gateway.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
+base64 = "0.22"
+contextvm-sdk = "0.2.2"
+hex = "0.4"
+lightning-invoice = "0.33"
+nostr-sdk = "0.44"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form"] }
+rmcp = { version = "1.8", features = ["server", "client", "macros", "transport-worker"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+tokio-util = "0.7"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "display"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+nostr-relay-builder = "0.44"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
