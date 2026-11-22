@@ -237,7 +237,7 @@ impl Service {
             bolt11::check(&pr, &want).map_err(|e| self.failure(format!("the backend's invoice was refused: {e}")))?;
         *lock(&self.payee) = Some(checked.payee);
         self.made.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(name = %p.name, msat = p.amount_msat, comment = %comment, "invoice made");
+        tracing::info!(name = %p.name, msat = p.amount_msat, comment = ?comment, "invoice made");
         Ok(MadeInvoice {
             pr,
             payment_hash: checked.payment_hash,

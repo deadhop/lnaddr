@@ -68,7 +68,18 @@ pub fn seed_keys(data: &std::path::Path) {
 }
 
 pub async fn stack_with(kind: Kind, tweak: impl FnOnce(&mut Config)) -> Stack {
-    let node_rig = node_rig(kind).await;
+    stack_on(node_rig(kind).await, tweak).await
+}
+
+/// A stack whose node and gateway both use only `relay`.
+pub async fn stack_on_relay(relay: &str, tweak: impl FnOnce(&mut Config)) -> Stack {
+    let mut rig = node_rig(Kind::Lnd).await;
+    rig.cfg.relays = vec![relay.to_string()];
+    rig.relay_url = relay.to_string();
+    stack_on(rig, tweak).await
+}
+
+pub async fn stack_on(node_rig: NodeRig, tweak: impl FnOnce(&mut Config)) -> Stack {
     let node = crate::node::app::start(node_rig.cfg.clone()).await.unwrap();
     let node_keys = node.keys.clone();
     let data = node_rig.dir.path().join("gateway");
@@ -1095,4 +1106,63 @@ async fn the_cache_is_refreshed_on_its_period() {
     assert!(seen, "the periodic refresh picked up the new address");
     admin.close().await;
     s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoices_resume_after_the_only_relay_drops_and_returns() {
+    use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let relay = LocalRelay::new(RelayBuilder::default().port(port));
+    relay.run().await.unwrap();
+    let url = format!("ws://127.0.0.1:{port}");
+    let s = stack_on_relay(&url, |c| c.limits.timeout = Duration::from_secs(4)).await;
+    let cb = "/.well-known/lnurlp/alice/callback?amount=1000";
+    let mut ok = false;
+    for _ in 0..30 {
+        if s.get(cb).await.0 == 200 {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(ok, "invoices flow over the relay");
+    relay.shutdown();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(s.get(cb).await.0, 503, "no relay: a clear failure");
+    let back = LocalRelay::new(RelayBuilder::default().port(port));
+    back.run().await.unwrap();
+    // Neither service is restarted: both reconnect by themselves.
+    let mut resumed = false;
+    for _ in 0..60 {
+        if s.get(cb).await.0 == 200 {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(resumed, "invoices resume once the relay is back");
+    back.shutdown();
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gateway_that_never_reached_its_node_says_unavailable_not_unknown() {
+    let rig = node_rig(Kind::Lnd).await;
+    let data = rig.dir.path().join("gw-cold");
+    seed_keys(&data);
+    let mut cfg = gateway_config(&rig, &Keys::generate(), &data);
+    cfg.limits.timeout = Duration::from_secs(2);
+    let gw = app::start(cfg).await.unwrap();
+    let http = crate::tls::http_client(Duration::from_secs(10));
+    let r = http
+        .get(format!("http://{}/.well-known/lnurlp/alice", gw.public))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    gw.until(Box::pin(async {})).await;
 }

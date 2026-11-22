@@ -62,7 +62,7 @@ pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
-fn spawn_conn(io: Box<dyn Io>, peer: Peer, app: Router, permit: tokio::sync::OwnedSemaphorePermit) {
+fn spawn_conn(io: Box<dyn Io>, peer: Peer, app: Router, permit: tokio::sync::OwnedSemaphorePermit, idle: Duration) {
     tokio::spawn(async move {
         let svc = tower::service_fn(move |mut req: axum::http::Request<hyper::body::Incoming>| {
             req.extensions_mut().insert(peer);
@@ -71,7 +71,7 @@ fn spawn_conn(io: Box<dyn Io>, peer: Peer, app: Router, permit: tokio::sync::Own
         let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         b.http1()
             .timer(TokioTimer::new())
-            .header_read_timeout(HEADER_TIMEOUT)
+            .header_read_timeout(idle)
             .max_buf_size(16 * 1024);
         let _ = b
             .http1_only()
@@ -83,7 +83,7 @@ fn spawn_conn(io: Box<dyn Io>, peer: Peer, app: Router, permit: tokio::sync::Own
 
 /// Serve `app` until `stop` is cancelled, with at most `max_conns` open connections.
 pub async fn serve(bound: Bound, app: Router, max_conns: u32, stop: CancellationToken) {
-    serve_from(&bound, app, max_conns, stop).await;
+    serve_from(&bound, app, max_conns, HEADER_TIMEOUT, stop).await;
     if let Bound::Unix(_, path) = &bound {
         let _ = std::fs::remove_file(path);
     }
@@ -106,7 +106,7 @@ impl Accept for Bound {
     }
 }
 
-async fn serve_from(bound: &(dyn Accept + Sync), app: Router, max_conns: u32, stop: CancellationToken) {
+async fn serve_from(bound: &(dyn Accept + Sync), app: Router, max_conns: u32, idle: Duration, stop: CancellationToken) {
     let permits = Arc::new(Semaphore::new(max_conns as usize));
     loop {
         let permit = tokio::select! {
@@ -116,8 +116,8 @@ async fn serve_from(bound: &(dyn Accept + Sync), app: Router, max_conns: u32, st
         tokio::select! {
             _ = stop.cancelled() => break,
             conn = bound.accept() => match conn {
-                Ok(Conn::Tcp(s, ip)) => spawn_conn(Box::new(s), Peer(Some(ip)), app.clone(), permit),
-                Ok(Conn::Unix(s)) => spawn_conn(Box::new(s), Peer(None), app.clone(), permit),
+                Ok(Conn::Tcp(s, ip)) => spawn_conn(Box::new(s), Peer(Some(ip)), app.clone(), permit, idle),
+                Ok(Conn::Unix(s)) => spawn_conn(Box::new(s), Peer(None), app.clone(), permit, idle),
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -195,26 +195,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connections_beyond_the_limit_wait_and_slow_headers_are_dropped() {
+    async fn a_client_that_sends_nothing_or_idles_cannot_hold_a_slot() {
         let stop = CancellationToken::new();
         let tcp = bind(&Listen::Tcp("127.0.0.1:0".parse().unwrap())).await.unwrap();
         let Listen::Tcp(addr) = tcp.local() else { unreachable!() };
-        tokio::spawn(serve(tcp, app(), 1, stop.clone()));
-        // One idle connection holds the only slot...
-        let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let quick = crate::tls::http_client(Duration::from_millis(500));
-        assert!(quick.get(format!("http://{addr}/")).send().await.is_err());
-        // ...until the header timeout drops it.
-        drop(idle);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let ok = crate::tls::http_client(Duration::from_secs(5))
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .unwrap();
-        assert!(ok.status().is_success());
-        stop.cancel();
+        tokio::spawn(async move { serve_from(&tcp, app(), 1, Duration::from_millis(200), stop).await });
+        let get =
+            |timeout_ms| crate::tls::http_client(Duration::from_millis(timeout_ms)).get(format!("http://{addr}/"));
+        // A socket that never sends a byte holds the only slot, then is dropped by the server.
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(get(100).send().await.is_err(), "the slot is taken");
+        assert!(
+            get(3000).send().await.unwrap().status().is_success(),
+            "served once the silent socket timed out"
+        );
+        // An idle keep-alive connection after a response is dropped the same way.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut kept = tokio::net::TcpStream::connect(addr).await.unwrap();
+        kept.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n").await.unwrap();
+        let mut buf = [0u8; 512];
+        let n = kept.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        assert!(
+            get(3000).send().await.unwrap().status().is_success(),
+            "served while the first client idles"
+        );
+        drop(kept);
     }
 
     struct Broken;
@@ -229,7 +236,7 @@ mod tests {
         let stop = CancellationToken::new();
         let task = tokio::spawn({
             let stop = stop.clone();
-            async move { serve_from(&Broken, app(), 4, stop).await }
+            async move { serve_from(&Broken, app(), 4, HEADER_TIMEOUT, stop).await }
         });
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(!task.is_finished());

@@ -133,6 +133,9 @@ impl Backend {
                     "description_hash": base64::engine::general_purpose::STANDARD.encode(hash),
                     "expiry": r.expiry_secs.to_string(),
                     "memo": "",
+                    // Route hints for private channels: a home node often has
+                    // nothing else, and without them nobody could pay it.
+                    "private": true,
                 })),
             Kind::Cln => self
                 .http
@@ -193,13 +196,15 @@ impl Backend {
                 excerpt(&body)
             )
         })?;
-        let field = match self.kind {
-            Kind::Lnd => "payment_request",
-            Kind::Cln => "bolt11",
-            Kind::Phoenixd => "serialized",
-            Kind::Lnbits => "bolt11",
+        // Older LNbits versions name the invoice `payment_request` only.
+        let (field, fallback) = match self.kind {
+            Kind::Lnd => ("payment_request", "payment_request"),
+            Kind::Cln => ("bolt11", "bolt11"),
+            Kind::Phoenixd => ("serialized", "serialized"),
+            Kind::Lnbits => ("bolt11", "payment_request"),
         };
         v.get(field)
+            .or_else(|| v.get(fallback))
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| format!("the {} backend's reply has no {field}", self.kind.name()))
@@ -260,6 +265,7 @@ pub mod testutil {
         let num = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap();
         let (msat, hash) = match kind {
             Kind::Lnd => {
+                assert_eq!(body["private"], true, "route hints for private channels");
                 let h = base64::engine::general_purpose::STANDARD
                     .decode(body["description_hash"].as_str().unwrap())
                     .unwrap();
@@ -501,6 +507,9 @@ mod tests {
             .await
             .unwrap_err()
             .contains("has no payment_request"));
+        *fake.fail.lock().unwrap() = Some((200, "{\"payment_request\":\"lnbcrt1older\"}".into()));
+        let older = Backend::new(Kind::Lnbits, &url, SECRET.into(), None, Duration::from_secs(5));
+        assert_eq!(older.create_invoice(&req(1_000)).await.unwrap(), "lnbcrt1older");
         *fake.fail.lock().unwrap() = None;
         *fake.delay.lock().unwrap() = Some(Duration::from_secs(3));
         let quick = Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_millis(300));

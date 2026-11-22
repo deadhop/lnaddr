@@ -326,7 +326,13 @@ impl Directory {
             return Ok(hit);
         }
         futures_join_all(self.nodes.iter().map(|n| n.refresh_if_due(MISS_REFRESH_GAP))).await;
-        self.find_cached(name, domain).ok_or(Fail::NotFound)
+        // A node never heard from might serve the name: say so, rather than "no such address".
+        let unknown = if self.nodes.iter().any(|n| read(&n.cache).is_none()) {
+            Fail::Unavailable
+        } else {
+            Fail::NotFound
+        };
+        self.find_cached(name, domain).ok_or(unknown)
     }
 
     /// The LUD-06 parameters of `name@domain`.
