@@ -20,6 +20,7 @@ path = "src/bin/lnaddr-gateway.rs"
 deadhop-tlspin = { path = "../server/crates/tlspin" }
 deadhop-cvm = { path = "../server/crates/cvm" }
 deadhop-net = { path = "../server/crates/net" }
+deadhop-common = { path = "../server/crates/common" }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
 base64 = "0.22"

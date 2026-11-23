@@ -522,6 +522,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
+name = "deadhop-common"
+version = "0.1.0"
+dependencies = [
+ "bip39",
+ "bitcoin",
+ "hex",
+ "nostr-sdk",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "deadhop-cvm"
 version = "0.1.0"
 dependencies = [
@@ -540,6 +552,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "contextvm-sdk",
+ "deadhop-common",
  "deadhop-cvm",
  "deadhop-net",
  "deadhop-tlspin",

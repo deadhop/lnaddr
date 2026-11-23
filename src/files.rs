@@ -3,10 +3,10 @@
 
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use nostr_sdk::prelude::{Keys, ToBech32};
+use nostr_sdk::prelude::Keys;
 
 /// Read a file that must be private to its owner; `None` if it does not
 /// exist. Permissions are read from the open handle, so the file that is
@@ -72,28 +72,20 @@ pub fn write_private(path: &Path, content: &str) -> Result<(), String> {
     write().map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Load a Nostr identity from `path`, creating it on first start.
+/// The shared crate's error, as text.
+fn text(e: deadhop_common::error::Error) -> String {
+    e.to_string()
+}
+
+/// Load a Nostr identity from `path`, creating it on first start (the shared
+/// crate's: the file must be private to its owner).
 pub fn load_or_create_keys(path: &Path) -> Result<Keys, String> {
-    if let Some(text) = read_private(path)? {
-        return Keys::parse(text.trim()).map_err(|_| format!("{} does not hold a nostr secret key", path.display()));
-    }
-    let keys = Keys::generate();
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .expect("a valid secret key always encodes as bech32");
-    write_private(path, &format!("{nsec}\n"))?;
-    Ok(keys)
+    deadhop_common::files::load_or_create_keys(path).map_err(text)
 }
 
 /// Create a directory if needed and make it private to the owner.
 pub fn open_dir(dir: &Path) -> Result<(), String> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .and_then(|()| fs::set_permissions(dir, fs::Permissions::from_mode(0o700)))
-        .map_err(|e| format!("{}: {e}", dir.display()))
+    deadhop_common::files::open_dir(dir).map_err(text)
 }
 
 #[cfg(test)]
@@ -113,7 +105,9 @@ mod tests {
         assert!(load_or_create_keys(&path).unwrap_err().contains("chmod 600"));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         write_private(&path, "not a key").unwrap();
-        assert!(load_or_create_keys(&path).unwrap_err().contains("does not hold"));
+        assert!(load_or_create_keys(&path)
+            .unwrap_err()
+            .contains("does not contain a nostr secret key"));
     }
 
     #[test]
