@@ -8,7 +8,7 @@
 //! switched off. A binary built with `sources = { file = false, env = false }`
 //! therefore runs only on its built-in values.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};
@@ -116,14 +116,9 @@ pub fn relay(s: &str) -> Result<String, String> {
     }
 }
 
-pub fn is_loopback_host(host: &str) -> bool {
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    bare == "localhost" || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
-
-pub fn is_overlay_host(host: &str) -> bool {
-    host.ends_with(".onion") || host.ends_with(".i2p")
-}
+// The host classifiers are the shared net crate's (overlay hosts include
+// `.fips`, any case and a trailing dot).
+pub use deadhop_net::hosts::{is_loopback_host, is_overlay_host};
 
 /// A SOCKS5 proxy for relay connections, as `host:port` or `socks5://host:port`.
 pub fn socks5(s: &str) -> Result<SocketAddr, String> {

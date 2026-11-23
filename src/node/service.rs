@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use nostr_sdk::prelude::{Event, PublicKey, ToBech32};
+use nostr_sdk::prelude::{PublicKey, ToBech32};
 use tokio::sync::Semaphore;
 
 use crate::bolt11::{self, Expect, Network};
@@ -34,12 +34,8 @@ fn refuse(code: &'static str, message: impl Into<String>) -> Refusal {
     }
 }
 
-/// Who is calling: the key that signed the request, and the request itself.
-#[derive(Debug, Clone, Default)]
-pub struct Caller {
-    pub pubkey: Option<String>,
-    pub event: Option<Event>,
-}
+// Who is asking: the shared ContextVM crate's caller.
+pub use deadhop_cvm::caller::Caller;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {

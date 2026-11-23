@@ -2,27 +2,21 @@
 
 use std::sync::Arc;
 
-use contextvm_sdk::transport::server::{ClientPubkey, InboundEvent};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ErrorCode, Extensions, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use serde_json::json;
 
-use crate::node::service::{Caller, Refusal, Service};
+use crate::node::service::{Refusal, Service};
 use crate::proto::{
     self, code, AddressList, ConfigView, MadeInvoice, MakeInvoiceParams, RemoveAddressParams, SetAddressParams,
     SetLimitsParams, Status,
 };
 
-/// The caller's key and request event, as the Nostr transport hands them over.
-pub fn caller_from(ext: &Extensions) -> Caller {
-    Caller {
-        pubkey: ext.get::<ClientPubkey>().map(|p| p.0.clone()),
-        event: ext.get::<InboundEvent>().map(|e| e.0.clone()),
-    }
-}
+// Reading the caller is the shared ContextVM crate's.
+pub use deadhop_cvm::caller::caller_from;
 
 /// A JSON-RPC error carrying the refusal's code in `data.code`.
 pub fn rpc_error(r: Refusal) -> ErrorData {
@@ -177,6 +171,7 @@ pub const TOOLS: [&str; 7] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::model::Extensions;
 
     #[test]
     fn refusals_map_to_stable_codes() {

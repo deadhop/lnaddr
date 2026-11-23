@@ -13,7 +13,6 @@ use rmcp::{RoleServer, ServiceExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::handshake::LocalHandshake;
 use crate::node::config::{self, Config, KEY_FILE};
 use crate::node::mcp::NodeServer;
 use crate::node::service::Service;
@@ -50,7 +49,7 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
     let transport = NostrServerTransport::with_relay_pool(transport_config, pool.clone())
         .await
         .map_err(crate::why)?;
-    let transport = LocalHandshake::new(IntoTransport::<RoleServer, _, _>::into_transport(transport));
+    let transport = crate::handshake::local(IntoTransport::<RoleServer, _, _>::into_transport(transport));
     let svc = Arc::new(Service::new(cfg));
     let cancel = CancellationToken::new();
     let task = tokio::spawn({
