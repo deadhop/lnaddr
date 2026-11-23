@@ -1166,3 +1166,31 @@ async fn a_gateway_that_never_reached_its_node_says_unavailable_not_unknown() {
     assert_eq!(r.status().as_u16(), 503);
     gw.until(Box::pin(async {})).await;
 }
+
+/// The whole path, with the node and the gateway each reaching the relay
+/// through a proxy: SOCKS5, then HTTP CONNECT.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lightning_address_works_through_a_socks5_or_an_http_connect_proxy() {
+    let (socks, _s) = deadhop_net::testing::socks5_proxy(None).await;
+    let (connect, _c) = deadhop_net::testing::connect_proxy(false, None).await;
+    for url in [
+        format!("socks5://127.0.0.1:{socks}"),
+        format!("http://127.0.0.1:{connect}"),
+    ] {
+        let proxy = crate::settings::socks5(&url).unwrap();
+        let mut rig = crate::node::app::tests::node_rig(Kind::Lnd).await;
+        rig.cfg.socks5 = Some(proxy.clone());
+        let s = stack_on(rig, |c| c.socks5 = Some(proxy)).await;
+        let (status, params) = s.get("/.well-known/lnurlp/alice").await;
+        assert_eq!(status, 200, "{url}: {params}");
+        let path = params["callback"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("http://pay.example")
+            .to_string();
+        let (status, inv) = s.get(&format!("{path}?amount=21000")).await;
+        assert_eq!(status, 200, "{url}: {inv}");
+        assert!(inv["pr"].as_str().unwrap().starts_with("lnbc"), "{url}: {inv}");
+        s.stop().await;
+    }
+}
