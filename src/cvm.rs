@@ -6,7 +6,6 @@
 //! either side, so a node restart never strands the gateway on a dead
 //! session, and the first invoice after a restart costs no extra round trip.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,7 +64,7 @@ impl NodeClient {
         keys: Keys,
         node: &PublicKey,
         relays: &[String],
-        socks5: Option<SocketAddr>,
+        socks5: Option<crate::pool::ProxySpec>,
         timeout: Duration,
     ) -> Result<Self, String> {
         let pool = Arc::new(Pool::new(keys, socks5));
@@ -93,7 +92,7 @@ impl NodeClient {
 
     /// How many relays are connected.
     pub async fn relays_connected(&self) -> usize {
-        self.pool.connected().await
+        crate::pool::connected(&self.pool).await
     }
 
     /// Call `tool` with `args` and decode its structured result.

@@ -226,7 +226,7 @@ impl Admin {
         let links = admin_keys.map(|k| {
             cfg.nodes
                 .iter()
-                .map(|n| NodeLink::new(n.clone(), k.clone(), cfg.socks5, cfg.limits.timeout))
+                .map(|n| NodeLink::new(n.clone(), k.clone(), cfg.socks5.clone(), cfg.limits.timeout))
                 .collect()
         });
         Admin {

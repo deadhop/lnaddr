@@ -56,7 +56,7 @@ pub async fn start(cfg: Config) -> Result<Gateway, String> {
     let dir = Arc::new(Directory::new(
         cfg.nodes.clone(),
         keys.clone(),
-        cfg.socks5,
+        cfg.socks5.clone(),
         cfg.limits.timeout,
     ));
     let stop = CancellationToken::new();
@@ -183,7 +183,7 @@ fn admin_link(cfg: &Config, i: usize) -> Result<NodeLink, String> {
     Ok(NodeLink::new(
         cfg.nodes[i].clone(),
         keys,
-        cfg.socks5,
+        cfg.socks5.clone(),
         cfg.limits.timeout,
     ))
 }
@@ -285,7 +285,12 @@ fn own_keys(cfg: &Config) -> Result<Keys, String> {
 }
 
 async fn status_command(cfg: &Config, out: &mut dyn Write) -> Result<(), String> {
-    let dir = Directory::new(cfg.nodes.clone(), own_keys(cfg)?, cfg.socks5, cfg.limits.timeout);
+    let dir = Directory::new(
+        cfg.nodes.clone(),
+        own_keys(cfg)?,
+        cfg.socks5.clone(),
+        cfg.limits.timeout,
+    );
     let started = Instant::now();
     dir.refresh_all().await;
     let mut any = false;
@@ -346,7 +351,12 @@ async fn test_command(cfg: &Config, args: &[String], out: &mut dyn Write) -> Res
             cfg.domains.join(", ")
         ));
     }
-    let dir = Directory::new(cfg.nodes.clone(), own_keys(cfg)?, cfg.socks5, cfg.limits.timeout);
+    let dir = Directory::new(
+        cfg.nodes.clone(),
+        own_keys(cfg)?,
+        cfg.socks5.clone(),
+        cfg.limits.timeout,
+    );
     let started = Instant::now();
     let outcome = async {
         let a = dir.pay_params(&name, &domain).await.map_err(|f| f.reason())?;

@@ -9,7 +9,6 @@
 //! or let itself in.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -224,7 +223,7 @@ pub struct Config {
     pub relays: Vec<String>,
     pub gateways: Vec<PublicKey>,
     pub admins: Vec<PublicKey>,
-    pub socks5: Option<SocketAddr>,
+    pub socks5: Option<crate::pool::ProxySpec>,
     pub network: Network,
     pub backend: BackendConfig,
     pub limits: Limits,
@@ -609,7 +608,7 @@ invoices_per_minute = 5
         assert_eq!(c.limits.invoices_per_minute, 5);
         assert_eq!(c.limits.concurrent, 2);
         assert_eq!(c.network, Network::Regtest);
-        assert_eq!(c.socks5.unwrap().port(), 9050);
+        assert_eq!(c.socks5.unwrap().port, 9050);
         assert_eq!(c.admins.len(), 1);
         // File and environment addresses add up, per name.
         assert_eq!(c.addresses.keys().collect::<Vec<_>>(), ["alice", "bob", "carol"]);
@@ -695,7 +694,7 @@ description = "Only"
             ("LNADDR_NODE_GATEWAYS", "nope", "gateways: \"nope\""),
             ("LNADDR_NODE_GATEWAYS", "", "set the gateway's public key"),
             ("LNADDR_NODE_ADMINS", "nope", "admins: \"nope\""),
-            ("LNADDR_NODE_SOCKS5", "tor", "IP address and port"),
+            ("LNADDR_NODE_SOCKS5", "tor", "a port is required"),
             ("LNADDR_NODE_NETWORK", "doge", "unknown network"),
             ("LNADDR_NODE_BACKEND", "eclair", "unknown backend"),
             ("LNADDR_NODE_BACKEND_URL", "nope", "is not a URL"),

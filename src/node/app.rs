@@ -31,7 +31,7 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
     crate::files::open_dir(&cfg.data_dir)?;
     let keys = crate::files::load_or_create_keys(&cfg.data_dir.join(KEY_FILE))?;
     let allowed: Vec<String> = cfg.gateways.iter().chain(&cfg.admins).map(|k| k.to_hex()).collect();
-    let pool = Arc::new(Pool::new(keys.clone(), cfg.socks5));
+    let pool = Arc::new(Pool::new(keys.clone(), cfg.socks5.clone()));
     let transport_config = NostrServerTransportConfig::default()
         .with_relay_urls(cfg.relays.clone())
         .with_encryption_mode(EncryptionMode::Required)
@@ -70,7 +70,7 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
 
 impl Running {
     pub async fn relays_connected(&self) -> usize {
-        self.pool.connected().await
+        crate::pool::connected(&self.pool).await
     }
 
     /// Serve until `shutdown`; an error if the request loop ended first.

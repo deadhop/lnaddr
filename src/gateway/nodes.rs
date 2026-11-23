@@ -12,7 +12,6 @@
 //! the network and, when pinned, the Lightning node that must sign it.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -93,7 +92,7 @@ struct Snapshot {
 pub struct NodeLink {
     pub cfg: NodeConfig,
     keys: Keys,
-    socks5: Option<SocketAddr>,
+    socks5: Option<crate::pool::ProxySpec>,
     timeout: Duration,
     client: tokio::sync::Mutex<Option<Arc<NodeClient>>>,
     cache: RwLock<Option<Snapshot>>,
@@ -102,7 +101,7 @@ pub struct NodeLink {
 }
 
 impl NodeLink {
-    pub fn new(cfg: NodeConfig, keys: Keys, socks5: Option<SocketAddr>, timeout: Duration) -> Self {
+    pub fn new(cfg: NodeConfig, keys: Keys, socks5: Option<crate::pool::ProxySpec>, timeout: Duration) -> Self {
         let health = Health {
             npub: cfg.pubkey.to_bech32().expect("keys encode"),
             ..Default::default()
@@ -125,7 +124,7 @@ impl NodeLink {
             return Ok(c.clone());
         }
         let (keys, node, relays) = (self.keys.clone(), &self.cfg.pubkey, &self.cfg.relays);
-        let connected = NodeClient::connect(keys, node, relays, self.socks5, self.timeout).await;
+        let connected = NodeClient::connect(keys, node, relays, self.socks5.clone(), self.timeout).await;
         let c = Arc::new(connected.map_err(CallError::Closed)?);
         *slot = Some(c.clone());
         Ok(c)
@@ -291,13 +290,13 @@ pub struct Directory {
 const MISS_REFRESH_GAP: Duration = Duration::from_secs(10);
 
 impl Directory {
-    pub fn new(nodes: Vec<NodeConfig>, keys: Keys, socks5: Option<SocketAddr>, timeout: Duration) -> Self {
+    pub fn new(nodes: Vec<NodeConfig>, keys: Keys, socks5: Option<crate::pool::ProxySpec>, timeout: Duration) -> Self {
         // Each call gets a share of the request's deadline so a retry still fits.
         let per_call = timeout.mul_f64(0.45);
         Directory {
             nodes: nodes
                 .into_iter()
-                .map(|n| NodeLink::new(n, keys.clone(), socks5, per_call))
+                .map(|n| NodeLink::new(n, keys.clone(), socks5.clone(), per_call))
                 .collect(),
             metrics: Metrics::default(),
             timeout,

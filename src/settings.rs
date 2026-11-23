@@ -8,7 +8,7 @@
 //! switched off. A binary built with `sources = { file = false, env = false }`
 //! therefore runs only on its built-in values.
 
-use std::net::SocketAddr;
+use crate::pool::ProxySpec;
 
 use nostr_sdk::prelude::{FromBech32, PublicKey};
 use serde::{Deserialize, Serialize};
@@ -120,14 +120,17 @@ pub fn relay(s: &str) -> Result<String, String> {
 // `.fips`, any case and a trailing dot).
 pub use deadhop_net::hosts::{is_loopback_host, is_overlay_host};
 
-/// A SOCKS5 proxy for relay connections, as `host:port` or `socks5://host:port`.
-pub fn socks5(s: &str) -> Result<SocketAddr, String> {
-    let bare = s
-        .trim()
-        .trim_start_matches("socks5h://")
-        .trim_start_matches("socks5://");
-    bare.parse()
-        .map_err(|_| format!("proxy {s:?} must be an IP address and port, e.g. 127.0.0.1:9050"))
+/// The proxy for relay connections: `host:port` (SOCKS5), or a
+/// `socks5://`, `http://` or `https://` url (HTTP CONNECT for the last two).
+pub fn socks5(s: &str) -> Result<ProxySpec, String> {
+    let s = s.trim();
+    let url = if s.contains("://") {
+        s.to_string()
+    } else {
+        format!("socks5://{s}")
+    };
+    let spec = deadhop_net::relay::parse_proxy(&url).map_err(|e| format!("proxy {s:?}: {e}"))?;
+    spec.ok_or(format!("proxy {s:?} is empty"))
 }
 
 /// A secret is never printed: only whether it is set.
@@ -208,10 +211,22 @@ mod tests {
     }
 
     #[test]
-    fn proxies_are_socket_addresses() {
-        assert_eq!(socks5("socks5://127.0.0.1:9050").unwrap().port(), 9050);
-        assert_eq!(socks5("socks5h://127.0.0.1:9050").unwrap().port(), 9050);
-        assert_eq!(socks5("10.0.0.1:1080").unwrap().port(), 1080);
-        assert!(socks5("tor:9050").unwrap_err().contains("IP address and port"));
+    fn proxies_are_socks5_or_http_connect_urls() {
+        use deadhop_net::relay::ProxyKind;
+        let p = socks5("socks5://127.0.0.1:9050").unwrap();
+        assert_eq!(
+            (p.kind, p.host.as_str(), p.port),
+            (ProxyKind::Socks5, "127.0.0.1", 9050)
+        );
+        assert_eq!(socks5("socks5h://127.0.0.1:9050").unwrap().port, 9050);
+        // A bare address is SOCKS5; a name is fine too (Tor resolves .onion at the proxy).
+        assert_eq!(
+            (socks5("10.0.0.1:1080").unwrap().kind, socks5("tor:9050").unwrap().host),
+            (ProxyKind::Socks5, "tor".into())
+        );
+        assert_eq!(socks5("http://127.0.0.1:3128").unwrap().kind, ProxyKind::Http);
+        assert_eq!(socks5("https://proxy.example:443").unwrap().kind, ProxyKind::Https);
+        assert!(socks5("ftp://h:1").unwrap_err().contains("scheme must be"));
+        assert!(socks5("socks5://h").unwrap_err().contains("port"));
     }
 }
