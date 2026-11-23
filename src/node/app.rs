@@ -142,7 +142,8 @@ fn print_check(cfg: &Config, out: &mut dyn Write) {
     let _ = writeln!(out, "  network    {:?}", cfg.network);
     let pin = b
         .pin
-        .map(|p| format!(", pinned {}…", &hex::encode(p)[..16]))
+        .as_ref()
+        .map(|p| format!(", pinned {}…", &hex::encode(p[0])[..16]))
         .unwrap_or_default();
     let _ = writeln!(
         out,
@@ -518,7 +519,7 @@ pub mod tests {
         assert!(start(cfg).await.is_err());
         // A pinned backend says so in the summary.
         let mut pinned = r.cfg.clone();
-        pinned.backend.pin = Some([0xab; 32]);
+        pinned.backend.pin = Some(vec![[0xab; 32]]);
         let mut out = Vec::new();
         print_check(&pinned, &mut out);
         assert!(String::from_utf8(out).unwrap().contains("pinned abababababababab…"));

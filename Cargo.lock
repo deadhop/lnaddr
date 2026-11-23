@@ -529,6 +529,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "contextvm-sdk",
+ "deadhop-tlspin",
  "futures-util",
  "hex",
  "hyper",
@@ -552,6 +553,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots 1.0.12",
+]
+
+[[package]]
+name = "deadhop-tlspin"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bitcoin",
+ "hex",
+ "rustls",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

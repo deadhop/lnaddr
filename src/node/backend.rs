@@ -96,7 +96,7 @@ fn excerpt(body: &str) -> String {
 }
 
 impl Backend {
-    pub fn new(kind: Kind, base: &str, secret: String, pin: Option<[u8; 32]>, timeout: Duration) -> Self {
+    pub fn new(kind: Kind, base: &str, secret: String, pin: Option<Vec<[u8; 32]>>, timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
             .use_preconfigured_tls(crate::tls::client_config(pin))
             .connect_timeout(timeout.min(Duration::from_secs(5)))
@@ -457,11 +457,17 @@ mod tests {
             Kind::Lnd,
             &url,
             SECRET.into(),
-            Some(crate::tls::fingerprint(&cert.der)),
+            Some(vec![crate::tls::fingerprint(&cert.der)]),
             Duration::from_secs(5),
         );
         check(&pinned.create_invoice(&req(5_000)).await.unwrap(), 5_000);
-        let wrong = Backend::new(Kind::Lnd, &url, SECRET.into(), Some([0; 32]), Duration::from_secs(5));
+        let wrong = Backend::new(
+            Kind::Lnd,
+            &url,
+            SECRET.into(),
+            Some(vec![[0; 32]]),
+            Duration::from_secs(5),
+        );
         assert!(wrong
             .create_invoice(&req(5_000))
             .await
@@ -475,7 +481,7 @@ mod tests {
             Kind::Cln,
             &url12,
             SECRET.into(),
-            Some(crate::tls::fingerprint(&cert12.der)),
+            Some(vec![crate::tls::fingerprint(&cert12.der)]),
             Duration::from_secs(5),
         );
         check(&old.create_invoice(&req(5_000)).await.unwrap(), 5_000);

@@ -93,7 +93,7 @@ impl Service {
 
     pub fn with_clock(cfg: Config, now: fn() -> u64) -> Self {
         let b = &cfg.backend;
-        let backend = Backend::new(b.kind, &b.url, b.secret.clone(), b.pin, b.timeout);
+        let backend = Backend::new(b.kind, &b.url, b.secret.clone(), b.pin.clone(), b.timeout);
         let limiter = std::sync::Arc::new(RateLimiter::new(
             cfg.limits.invoices_per_minute,
             cfg.limits.per_caller_per_minute,
@@ -286,7 +286,7 @@ impl Service {
                 kind: b.kind.name().into(),
                 url: b.url.clone(),
                 secret: crate::settings::redact(true).into(),
-                tls_pin: b.pin.map(hex::encode),
+                tls_pin: b.pin.as_deref().map(crate::tls::pins_text),
             },
             limits: proto::LimitsView {
                 invoices_per_minute: s.limits.invoices_per_minute,

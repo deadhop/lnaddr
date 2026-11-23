@@ -16,6 +16,8 @@ name = "lnaddr-gateway"
 path = "src/bin/lnaddr-gateway.rs"
 
 [dependencies]
+# Shared with the payment service (path dependencies; the image builds from the repo root).
+deadhop-tlspin = { path = "../server/crates/tlspin" }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
 base64 = "0.22"

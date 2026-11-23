@@ -202,7 +202,7 @@ pub struct BackendConfig {
     pub kind: Kind,
     pub url: String,
     pub secret: String,
-    pub pin: Option<[u8; 32]>,
+    pub pin: Option<Vec<[u8; 32]>>,
     pub timeout: Duration,
 }
 
@@ -212,7 +212,7 @@ impl std::fmt::Debug for BackendConfig {
             .field("kind", &self.kind)
             .field("url", &self.url)
             .field("secret", &settings::redact(true))
-            .field("pin", &self.pin.map(hex::encode))
+            .field("pin", &self.pin.as_deref().map(crate::tls::pins_hex))
             .finish()
     }
 }
@@ -449,12 +449,12 @@ fn backend(b: BackendLayer) -> Result<BackendConfig, String> {
         (None, None) => return Err("backend: set backend.secret_file (or backend.secret)".into()),
     };
     let pin = match (b.tls_cert_sha256, b.tls_cert_file) {
-        (Some(p), _) => Some(crate::tls::parse_pin(&p).map_err(|e| format!("backend: {e}"))?),
+        (Some(p), _) => Some(crate::tls::parse_pins(&p).map_err(|e| format!("backend: {e}"))?),
         (None, Some(path)) => {
             let pem = std::fs::read_to_string(&path).map_err(|e| format!("backend: {}: {e}", path.display()))?;
-            Some(crate::tls::fingerprint(
+            Some(vec![crate::tls::fingerprint(
                 &crate::tls::first_pem_cert(&pem).map_err(|e| format!("backend: {e}"))?,
-            ))
+            )])
         }
         (None, None) => None,
     };
@@ -604,7 +604,7 @@ invoices_per_minute = 5
         assert_eq!(c.data_dir, Path::new("/builtin"));
         assert_eq!(c.backend.kind, Kind::Lnd);
         assert_eq!(c.backend.secret, "from-builtin");
-        assert_eq!(c.backend.pin, Some([0xab; 32]));
+        assert_eq!(c.backend.pin, Some(vec![[0xab; 32]]));
         assert_eq!(c.backend.timeout, Duration::from_secs(3));
         assert_eq!(c.limits.invoices_per_minute, 5);
         assert_eq!(c.limits.concurrent, 2);
@@ -757,7 +757,7 @@ description = "Only"
         let mut pairs = minimal();
         pairs.push(("LNADDR_NODE_BACKEND_TLS_CERT_FILE", path.display().to_string()));
         let c = load_pairs(None, &pairs).unwrap();
-        assert_eq!(c.backend.pin, Some(crate::tls::fingerprint(&cert.der)));
+        assert_eq!(c.backend.pin, Some(vec![crate::tls::fingerprint(&cert.der)]));
         let secret = dir.path().join("pw");
         crate::files::write_private(&secret, "filepw\n").unwrap();
         let mut file_secret = minimal();
