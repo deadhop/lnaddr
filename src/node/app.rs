@@ -173,17 +173,13 @@ pub async fn check(cfg: &Config, out: &mut dyn Write) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let caller = crate::node::service::Caller {
-        pubkey: cfg.gateways.first().or(cfg.admins.first()).map(|k| k.to_hex()),
-        event: None,
-    };
     let p = crate::proto::MakeInvoiceParams {
         name: probe.0.clone(),
         domain: "check.invalid".into(),
         amount_msat: probe.1,
         comment: None,
     };
-    match svc.make_invoice(&caller, p).await {
+    match svc.invoice("local check", p).await {
         Ok(made) => {
             let _ = writeln!(
                 out,

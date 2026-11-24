@@ -132,13 +132,17 @@ impl Service {
             Some(k) if self.cfg.gateways.contains(&k) => Role::Gateway,
             _ => return Err(refuse(code::UNAUTHORIZED, "this key may not use this node")),
         };
-        if let Some(e) = &c.event {
-            if e.created_at.as_secs().abs_diff((self.now)()) > MAX_CLOCK_SKEW_SECS {
-                return Err(refuse(
-                    code::UNAUTHORIZED,
-                    "the request's timestamp is too far from the node's clock",
-                ));
-            }
+        // The signed event is what proves the request is fresh: without it
+        // there is nothing to check, so the request is refused.
+        let e = c
+            .event
+            .as_ref()
+            .ok_or_else(|| refuse(code::UNAUTHORIZED, "request event missing"))?;
+        if e.created_at.as_secs().abs_diff((self.now)()) > MAX_CLOCK_SKEW_SECS {
+            return Err(refuse(
+                code::UNAUTHORIZED,
+                "the request's timestamp is too far from the node's clock",
+            ));
         }
         Ok(role)
     }
@@ -167,6 +171,13 @@ impl Service {
 
     pub async fn make_invoice(&self, c: &Caller, p: MakeInvoiceParams) -> Result<MadeInvoice, Refusal> {
         self.role(c)?;
+        self.invoice(c.pubkey.as_deref().unwrap_or_default(), p).await
+    }
+
+    /// Make an invoice for an already authorized request, rate-limited under
+    /// `limit_key`. `lnaddr-node check` calls this directly: it runs locally
+    /// and has no signed request to authorize.
+    pub(crate) async fn invoice(&self, limit_key: &str, p: MakeInvoiceParams) -> Result<MadeInvoice, Refusal> {
         let (address, limits, limiter) = {
             let s = self.read();
             (s.addresses.get(&p.name).cloned(), s.limits.clone(), s.limiter.clone())
@@ -197,7 +208,7 @@ impl Service {
                 format!("comments are at most {} characters", address.comment_allowed),
             ));
         }
-        if !limiter.allow(c.pubkey.as_deref().unwrap_or_default(), (self.now)()) {
+        if !limiter.allow(limit_key, (self.now)()) {
             return Err(refuse(code::RATE_LIMITED, "too many invoices; try again in a minute"));
         }
         // Waiting longer than half the backend's timeout leaves too little for the backend.
@@ -552,12 +563,15 @@ pub mod tests {
         assert!(svc.config_view(&gw).is_err());
         let p = proto::RemoveAddressParams { name: "alice".into() };
         assert!(svc.remove_address(&gw, p).is_err());
-        // Without an event (a test transport) the key alone decides.
+        // A known key without its signed event is refused: freshness cannot
+        // be checked without it.
         let bare = Caller {
             pubkey: Some(admin_keys().public_key().to_hex()),
             event: None,
         };
-        assert!(svc.status(&bare).is_ok());
+        let r = svc.status(&bare).unwrap_err();
+        assert_eq!(r.code, code::UNAUTHORIZED);
+        assert!(r.message.contains("request event missing"), "{}", r.message);
     }
 
     #[tokio::test]
