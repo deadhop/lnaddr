@@ -9,7 +9,7 @@ A Lightning address (LUD-16) for a node with no public address. Two static binar
 wallet ──https──▶ reverse proxy ──▶ lnaddr-gateway ──Nostr relays──▶ lnaddr-node ──▶ your Lightning backend
 ```
 
-Documentation: `site/lnaddr-docs/` (published at `/lud16-lnaddr/docs/`): architecture, performance, hardening, security, configuration, reverse proxies, backends, admin.
+Documentation: `site/docs/lnaddr/` (published at `/docs/lnaddr/`): architecture, performance, hardening, security, configuration, reverse proxies, backends, admin.
 
 ## Build
 
