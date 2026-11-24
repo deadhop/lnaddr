@@ -27,7 +27,11 @@ use crate::gateway::server::Peer;
 use crate::proto::{self, ConfigView, Status};
 use crate::ratelimit::RateLimiter;
 
+/// The session cookie on plain-HTTP (loopback) deployments.
 const COOKIE: &str = "lnaddr_session";
+/// The session cookie when it is `Secure`: the `__Host-` prefix makes browsers
+/// refuse it from a subdomain, another path or a plain-HTTP response.
+const HOST_COOKIE: &str = "__Host-lnaddr_session";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const MAX_SESSIONS: usize = 32;
 
@@ -249,13 +253,31 @@ impl Admin {
         }
     }
 
+    /// The session cookie's name: `__Host-` prefixed whenever it is `Secure`.
+    fn cookie(&self) -> &'static str {
+        if self.cfg.secure_cookie {
+            HOST_COOKIE
+        } else {
+            COOKIE
+        }
+    }
+
+    /// The attributes every session cookie carries, set or cleared.
+    fn cookie_attrs(&self) -> &'static str {
+        if self.cfg.secure_cookie {
+            "HttpOnly; SameSite=Strict; Path=/; Secure"
+        } else {
+            "HttpOnly; SameSite=Strict; Path=/"
+        }
+    }
+
     fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
         self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The session's CSRF token, if the request carries a live session.
     fn session(&self, headers: &HeaderMap) -> Option<String> {
-        let cookie = session_cookie(headers)?;
+        let cookie = session_cookie(headers, self.cookie())?;
         let mut s = self.sessions();
         match s.get(&cookie) {
             Some(sess) if sess.expires > Instant::now() => Some(sess.csrf.clone()),
@@ -628,10 +650,11 @@ async fn post_login(State(a): St, Extension(peer): Extension<Peer>, Form(f): For
             },
         );
     }
-    let secure = if a.cfg.secure_cookie { "; Secure" } else { "" };
     let mut r = redirect("/");
     let cookie = format!(
-        "{COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{secure}",
+        "{}={id}; {}; Max-Age={}",
+        a.cookie(),
+        a.cookie_attrs(),
         SESSION_TTL.as_secs()
     );
     r.headers_mut().insert(
@@ -641,8 +664,8 @@ async fn post_login(State(a): St, Extension(peer): Extension<Peer>, Form(f): For
     r
 }
 
-/// The session id in the request's cookies.
-fn session_cookie(headers: &HeaderMap) -> Option<String> {
+/// The session id in the request's cookie called `name`.
+fn session_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -650,7 +673,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
         .flat_map(|v| v.split(';'))
         .find_map(|c| {
             let (k, v) = c.trim().split_once('=')?;
-            (k == COOKIE).then(|| v.to_string())
+            (k == name).then(|| v.to_string())
         })
 }
 
@@ -660,12 +683,15 @@ async fn post_logout(State(a): St, headers: HeaderMap, Form(f): Form<LogoutForm>
     if let Err(r) = a.check_post(&headers, &f.csrf) {
         return *r;
     }
-    let id = session_cookie(&headers).unwrap_or_default();
+    let id = session_cookie(&headers, a.cookie()).unwrap_or_default();
     a.sessions().remove(&id);
     let mut r = redirect("/login");
+    // Cleared under the same name and attributes it was set with, or a
+    // browser keeps the `__Host-` cookie.
+    let clear = format!("{}=; {}; Max-Age=0", a.cookie(), a.cookie_attrs());
     r.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("lnaddr_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+        HeaderValue::from_str(&clear).expect("cookie is ASCII"),
     );
     r
 }
@@ -856,6 +882,46 @@ mod tests {
         let s = a.sessions();
         assert_eq!(s.len(), MAX_SESSIONS);
         assert!(!s.contains_key("s0"), "the session closest to expiry was dropped");
+    }
+
+    #[tokio::test]
+    async fn a_secure_session_cookie_is_host_prefixed() {
+        let cookies = |r: &Response| r.headers()[header::SET_COOKIE].to_str().unwrap().to_string();
+        let mut a = admin();
+        a.cfg.secure_cookie = true;
+        let a = Arc::new(a);
+        let r = post_login(
+            State(a.clone()),
+            Extension(Peer(None)),
+            Form(LoginForm { token: "t".into() }),
+        )
+        .await;
+        let set = cookies(&r);
+        assert!(
+            set.starts_with("__Host-lnaddr_session=")
+                && set.contains("; HttpOnly; SameSite=Strict; Path=/; Secure; Max-Age="),
+            "{set}"
+        );
+        let id = set
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("__Host-lnaddr_session=");
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("__Host-lnaddr_session={id}")).unwrap(),
+        );
+        assert!(a.session(&h).is_some());
+        // The unprefixed name, which an unrelated subdomain could set, is not read.
+        assert!(a.session(&with_cookie(id)).is_none());
+        let csrf = a.session(&h).unwrap();
+        let r = post_logout(State(a.clone()), h.clone(), Form(LogoutForm { csrf })).await;
+        assert_eq!(
+            cookies(&r),
+            "__Host-lnaddr_session=; HttpOnly; SameSite=Strict; Path=/; Secure; Max-Age=0"
+        );
+        assert!(a.session(&h).is_none());
     }
 
     #[tokio::test]
