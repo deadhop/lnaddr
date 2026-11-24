@@ -156,16 +156,19 @@ fn redirect(to: &str) -> Response {
     r
 }
 
-fn layout(title: &str, nav: Option<&str>, body: &str) -> String {
+/// A page. `nav` is the signed-in navigation: the current link and the
+/// session's CSRF token, which the sign-out form carries.
+fn layout(title: &str, nav: Option<(&str, &str)>, body: &str) -> String {
     let links = match nav {
-        Some(on) => {
+        Some((on, csrf)) => {
             let a = |href: &str, label: &str| {
                 let class = if on == href { " class=\"on\"" } else { "" };
                 format!("<a href=\"{href}\"{class}>{label}</a>")
             };
             format!(
-                "<nav>{}<form class=\"inline\" method=\"post\" action=\"/logout\"><button class=\"quiet\">Sign out</button></form></nav>",
-                a("/", "OVERVIEW")
+                "<nav>{}<form class=\"inline\" method=\"post\" action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"quiet\">Sign out</button></form></nav>",
+                a("/", "OVERVIEW"),
+                esc(csrf)
             )
         }
         None => String::new(),
@@ -195,6 +198,12 @@ pub struct AddressForm {
     comment_allowed: String,
     #[serde(default)]
     domains: String,
+}
+
+#[derive(Deserialize)]
+pub struct LogoutForm {
+    #[serde(default)]
+    csrf: String,
 }
 
 #[derive(Deserialize)]
@@ -372,7 +381,7 @@ impl Admin {
         let Some(n) = self.dir.nodes.get(i) else {
             return html(
                 StatusCode::NOT_FOUND,
-                layout("Not found", Some("/"), "<h1>No such node.</h1>"),
+                layout("Not found", Some(("/", csrf)), "<h1>No such node.</h1>"),
             );
         };
         let h = n.health().await;
@@ -394,7 +403,7 @@ impl Admin {
                 "<div class=\"card dashed\"><p>Read only: this gateway has no admin key. Run <code>lnaddr-gateway admin-pubkey</code>, add the key it prints to the node's <code>admins</code>, and restart the gateway.</p></div>{}",
                 self.address_table(n.addresses(), None, i)
             ));
-            return html(StatusCode::OK, layout("Node", Some("/nodes"), &body));
+            return html(StatusCode::OK, layout("Node", Some(("/nodes", csrf)), &body));
         };
         let link = &links[i];
         let (status, view) = tokio::join!(
@@ -445,7 +454,7 @@ impl Admin {
                 ));
             }
         }
-        html(StatusCode::OK, layout("Node", Some("/nodes"), &body))
+        html(StatusCode::OK, layout("Node", Some(("/nodes", csrf)), &body))
     }
 
     fn address_table(&self, addrs: Vec<proto::AddressInfo>, csrf: Option<&str>, i: usize) -> String {
@@ -645,7 +654,12 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-async fn post_logout(State(a): St, headers: HeaderMap) -> Response {
+/// Signing out is a form post like any other: another site must not be able
+/// to end the operator's session.
+async fn post_logout(State(a): St, headers: HeaderMap, Form(f): Form<LogoutForm>) -> Response {
+    if let Err(r) = a.check_post(&headers, &f.csrf) {
+        return *r;
+    }
     let id = session_cookie(&headers).unwrap_or_default();
     a.sessions().remove(&id);
     let mut r = redirect("/login");
@@ -657,11 +671,11 @@ async fn post_logout(State(a): St, headers: HeaderMap) -> Response {
 }
 
 async fn get_overview(State(a): St, headers: HeaderMap) -> Response {
-    if a.session(&headers).is_none() {
+    let Some(csrf) = a.session(&headers) else {
         return redirect("/login");
-    }
+    };
     let body = a.overview().await;
-    html(StatusCode::OK, layout("Overview", Some("/"), &body))
+    html(StatusCode::OK, layout("Overview", Some(("/", &csrf)), &body))
 }
 
 async fn get_node(State(a): St, Path(i): Path<usize>, Query(q): Query<NodeQuery>, headers: HeaderMap) -> Response {
