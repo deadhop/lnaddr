@@ -445,8 +445,43 @@ async fn names_listed_for_a_node_limit_what_it_serves() {
     s.stop().await;
 }
 
+/// A request over the gateway's Unix socket carrying `xff`: its status line.
+async fn over_socket(sock: &std::path::Path, xff: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut c = tokio::net::UnixStream::connect(sock).await.unwrap();
+    let req = format!("GET /.well-known/lnurlp/alice/callback?amount=1000 HTTP/1.1\r\nhost: pay.example\r\nx-forwarded-for: {xff}\r\nconnection: close\r\n\r\n");
+    c.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    c.read_to_string(&mut out).await.unwrap();
+    out.lines().next().unwrap().to_string()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn a_unix_socket_listener_trusts_its_proxy() {
+async fn a_unix_socket_listener_trusts_a_listed_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("gw.sock");
+    let s = stack_with(Kind::Lnd, |c| {
+        c.listen = Listen::Unix(sock.clone());
+        c.trusted_proxies = vec![crate::gateway::config::Net::parse("127.0.0.1").unwrap()];
+        c.limits.per_ip_per_minute = 1;
+    })
+    .await;
+    let fetch = |xff: &'static str| over_socket(&sock, xff);
+    assert!(fetch("203.0.113.9").await.contains("200"));
+    assert!(fetch("203.0.113.9").await.contains("429"));
+    // An appending proxy: the last address that is not a proxy is the client.
+    assert!(fetch("198.51.100.1, 203.0.113.10, 127.0.0.1").await.contains("200"));
+    assert!(fetch("203.0.113.10").await.contains("429"));
+    assert!(
+        fetch("not-an-ip").await.contains("200"),
+        "no usable address: the socket's own budget"
+    );
+    assert!(fetch("also-not").await.contains("429"));
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unix_socket_without_trusted_proxies_shares_one_budget() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("gw.sock");
     let s = stack_with(Kind::Lnd, |c| {
@@ -454,26 +489,12 @@ async fn a_unix_socket_listener_trusts_its_proxy() {
         c.limits.per_ip_per_minute = 1;
     })
     .await;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let fetch = |xff: &'static str| {
-        let sock = sock.clone();
-        async move {
-            let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
-            let req = format!("GET /.well-known/lnurlp/alice/callback?amount=1000 HTTP/1.1\r\nhost: pay.example\r\nx-forwarded-for: {xff}\r\nconnection: close\r\n\r\n");
-            c.write_all(req.as_bytes()).await.unwrap();
-            let mut out = String::new();
-            c.read_to_string(&mut out).await.unwrap();
-            out.lines().next().unwrap().to_string()
-        }
-    };
+    let fetch = |xff: &'static str| over_socket(&sock, xff);
     assert!(fetch("203.0.113.9").await.contains("200"));
-    assert!(fetch("203.0.113.9").await.contains("429"));
-    assert!(fetch("203.0.113.10").await.contains("200"));
-    assert!(
-        fetch("not-an-ip").await.contains("200"),
-        "no usable address: the socket's own budget"
-    );
-    assert!(fetch("also-not").await.contains("429"));
+    // A spoofed X-Forwarded-For, passed through by a proxy that does not
+    // append, cannot steer the limiter to a fresh bucket.
+    assert!(fetch("203.0.113.10").await.contains("429"));
+    assert!(fetch("198.51.100.77").await.contains("429"));
     s.stop().await;
 }
 

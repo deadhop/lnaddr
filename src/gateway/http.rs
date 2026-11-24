@@ -19,7 +19,7 @@ use axum::routing::get;
 use axum::{Extension, Router};
 use serde_json::json;
 
-use crate::gateway::config::Config;
+use crate::gateway::config::{Config, Listen};
 use crate::gateway::nodes::{Directory, Fail};
 use crate::gateway::server::Peer;
 use crate::lnurl::{self, ErrorResponse, InvoiceResponse, PayRequest};
@@ -34,6 +34,13 @@ pub struct Public {
 
 impl Public {
     pub fn new(cfg: Config, dir: Arc<Directory>) -> Self {
+        if Self::socket_without_proxies(&cfg) {
+            tracing::warn!(
+                "listening on a Unix socket without trusted_proxies: X-Forwarded-For is ignored and every \
+                 client shares one rate limit; list the proxy in trusted_proxies once it appends the \
+                 client's address"
+            );
+        }
         let l = &cfg.limits;
         Public {
             // Parameters come from the cache, so they get a larger budget.
@@ -72,11 +79,24 @@ impl Public {
         }
     }
 
+    /// A Unix socket names no proxy address, so only `trusted_proxies` says
+    /// that the proxy on it appends the client's address to X-Forwarded-For
+    /// rather than passing on whatever the client sent.
+    fn socket_without_proxies(cfg: &Config) -> bool {
+        matches!(cfg.listen, Listen::Unix(_)) && cfg.trusted_proxies.is_empty()
+    }
+
     /// The client's address: the peer, or for a trusted proxy the last
-    /// address in X-Forwarded-For that is not itself a trusted proxy.
+    /// address in X-Forwarded-For that is not itself a trusted proxy. On a
+    /// Unix socket with no `trusted_proxies`, every client is `local`: a
+    /// proxy that passes the header through unchanged would otherwise let
+    /// each client pick its own rate-limit key.
     fn client_ip(&self, peer: Peer, headers: &HeaderMap) -> String {
         if !self.trusted(peer) {
             return peer.0.map(|ip| ip.to_string()).unwrap_or_default();
+        }
+        if peer.0.is_none() && self.cfg.trusted_proxies.is_empty() {
+            return "local".into();
         }
         let forwarded: Vec<IpAddr> = headers
             .get_all("x-forwarded-for")
