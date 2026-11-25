@@ -11,6 +11,7 @@ COPY brand/logo/mark-currentcolor.svg brand/logo/
 COPY brand/icons/favicon.svg brand/icons/
 COPY brand/fonts/*.woff2 brand/fonts/
 COPY server/crates server/crates
+COPY server/vendor server/vendor
 COPY lnaddr/Cargo.toml lnaddr/Cargo.lock lnaddr/
 COPY lnaddr/src lnaddr/src
 COPY lnaddr/assets lnaddr/assets
