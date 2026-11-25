@@ -51,6 +51,9 @@ pub const RELAY_EVENTS_KEPT: usize = 20_000;
 pub const MAX_RELAYS: usize = 8;
 /// The host setting that keeps the proxies host-only.
 pub const LOCK_SETTING: &str = "LNADDR_NODE_PROXY_LOCKED";
+/// How the lock is named while remote settings are off (which also keeps
+/// the proxies host-only).
+pub const REMOTE_OFF: &str = "remote settings off: LNADDR_NODE_REMOTE";
 
 /// The node's lanes: one.
 pub fn lanes() -> Vec<Lane> {
@@ -179,7 +182,10 @@ pub struct AuditEntry {
 
 /// Append one entry to the audit log at `path`, dropping the oldest entries
 /// first when it would grow past `max` bytes.
+/// Appends one at a time, so two at the size limit cannot drop each other's entries.
 pub fn append_audit(path: &Path, entry: &AuditEntry, max: u64) -> Result<(), String> {
+    static APPENDING: Mutex<()> = Mutex::new(());
+    let _one = lock(&APPENDING);
     let line = serde_json::to_string(entry).expect("audit entries always serialise") + "\n";
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let size = std::fs::metadata(path).map_or(0, |m| m.len());
@@ -362,6 +368,13 @@ impl NetworkHost for Service {
     }
 
     fn revert_proxies(&self, previous: ProxySettings, why: &str) -> EngineResult<()> {
+        // Locked proxies are the configuration's; nothing saved may replace them.
+        if self.config().proxy_locked {
+            return Err(to_engine(refuse(
+                code::LOCKED,
+                format!("the proxy settings are locked on the host ({LOCK_SETTING})"),
+            )));
+        }
         self.change_stored(|stored, base| {
             stored.proxies = (previous != base.proxies).then(|| whole(&previous));
         })
@@ -382,7 +395,7 @@ impl NetworkHost for Service {
     }
 
     fn proxy_locked(&self) -> bool {
-        self.config().proxy_locked
+        self.proxies_locked()
     }
 
     async fn relay_states(&self) -> Vec<RelayState> {
@@ -427,7 +440,7 @@ impl NetworkHost for Service {
             service: "lnaddr-node".into(),
             electrum: None,
             announce: None,
-            lock_setting: LOCK_SETTING.into(),
+            lock_setting: self.lock_setting().into(),
             test_place: "the console".into(),
         }
     }
@@ -475,6 +488,23 @@ fn check_relays(relays: &[String]) -> Result<(), Refusal> {
 
 impl Service {
     /// The admin calling, by hex public key.
+    /// Whether admins may not touch the proxies: locked on the host, or remote
+    /// settings off. Then only the listed proxies can be tested and no I2P
+    /// name looked up, so no admin key can make the node connect out through a
+    /// proxy of its choosing.
+    pub fn proxies_locked(&self) -> bool {
+        self.config().proxy_locked || !self.config().sources.remote
+    }
+
+    /// The host setting that keeps the proxies from admins now.
+    fn lock_setting(&self) -> &'static str {
+        if self.config().proxy_locked || self.config().sources.remote {
+            LOCK_SETTING
+        } else {
+            REMOTE_OFF
+        }
+    }
+
     pub(crate) fn admin_actor(&self, c: &Caller) -> Result<String, Refusal> {
         self.admin(c)?;
         Ok(c.pubkey.clone().unwrap_or_default())
@@ -503,7 +533,12 @@ impl Service {
         if !self.config().sources.remote {
             return Ok(());
         }
-        let stored = read_network(&self.config().data_dir)?;
+        let mut stored = read_network(&self.config().data_dir)?;
+        if self.config().proxy_locked && stored.proxies.take().is_some() {
+            tracing::warn!(
+                "{NETWORK_FILE}: the proxies are locked on the host ({LOCK_SETTING}); the saved ones are ignored"
+            );
+        }
         let next = stored.apply(self.net.baseline());
         if let Some(r) = &stored.relays {
             check_relays(r).map_err(|e| format!("{NETWORK_FILE}: {}", e.message))?;
@@ -565,7 +600,7 @@ impl Service {
             overridden: lock(&self.net.stored).names(),
             chain: crate::node::service::network_name(self.config().network).into(),
             keys: self.key_infos(),
-            proxy_locked: self.config().proxy_locked,
+            proxy_locked: self.proxies_locked(),
             restart_pending: self.net.restart_pending.load(Ordering::Relaxed),
             warnings: Vec::new(),
         }
@@ -605,6 +640,22 @@ impl Service {
         };
         if let Some(r) = &patch.relays {
             check_relays(r)?;
+            // The gateways were set up with the configured relays: a list that
+            // keeps none of them would cut every gateway off, and nothing would
+            // undo it because the new relays do connect.
+            let configured = &self.net.baseline().relays;
+            if !r
+                .iter()
+                .any(|x| configured.iter().any(|c| deadhop_netengine::network::same_relay(c, x)))
+            {
+                return Err(refuse(
+                    code::INVALID,
+                    format!(
+                        "relays: keep at least one of the configured relays ({}), which the gateways use to reach the node",
+                        configured.join(", ")
+                    ),
+                ));
+            }
         }
         next.validate().map_err(from_engine)?;
         if let Some(url) = patch
@@ -646,13 +697,15 @@ impl Service {
             }
         }
         let detail = serde_json::to_string(&shown).expect("patches always serialise");
-        self.record(&actor, "update_network", &detail)?;
-        if proxies_changed {
-            self.net.runtime.begin_probation(self, before.settings.proxies);
-        }
+        // Applied: the checks that undo a bad change run whatever happens to
+        // the audit log, which is reported after them.
         if relays_changed {
             self.schedule_restart();
         }
+        if proxies_changed {
+            self.net.runtime.begin_probation(self, before.settings.proxies);
+        }
+        self.record(&actor, "update_network", &detail)?;
         Ok(self.view())
     }
 
@@ -665,14 +718,14 @@ impl Service {
         }
         let before = self.net.settings();
         self.change_stored(|stored, _| *stored = NetworkFile::default())?;
-        self.record(&actor, "reset_network", "")?;
         let next = self.net.settings();
-        if next.proxies != before.proxies {
-            self.net.runtime.begin_probation(self, before.proxies.clone());
-        }
         if next.relays != before.relays || next.relay_keys != before.relay_keys {
             self.schedule_restart();
         }
+        if next.proxies != before.proxies {
+            self.net.runtime.begin_probation(self, before.proxies.clone());
+        }
+        self.record(&actor, "reset_network", "")?;
         Ok(self.view())
     }
 
@@ -729,6 +782,11 @@ impl Service {
     /// Wait until a change of relays asks for new connections.
     pub fn restart_requested(&self) -> tokio::sync::futures::Notified<'_> {
         self.net.restart.notified()
+    }
+
+    /// Whether a change of relays waits for the connections to be remade.
+    pub fn restart_pending(&self) -> bool {
+        self.net.restart_pending.load(Ordering::Relaxed)
     }
 
     pub(crate) fn schedule_restart(&self) {
@@ -963,7 +1021,7 @@ mod tests {
             .update_network(
                 &admin,
                 patch(json!({
-                    "relays": ["ws://127.0.0.1:2"],
+                    "relays": ["ws://127.0.0.1:1", "ws://127.0.0.1:2"],
                     "relay_names": { "ws://127.0.0.1:2": "home" },
                     "proxies": { "list": [{ "url": "socks5://u:secret@127.0.0.1:9050" }], "offline": "open" }
                 })),
@@ -1018,7 +1076,11 @@ mod tests {
             json!({ "proxies": { "list": [{ "url": "socks5://u:***@10.0.0.1:1" }] } }),
             "password is hidden",
         );
-        assert_eq!(svc.net.settings().relays, ["ws://127.0.0.1:2"]);
+        bad(
+            json!({ "relays": ["ws://127.0.0.1:2"] }),
+            "keep at least one of the configured relays",
+        );
+        assert_eq!(svc.net.settings().relays, ["ws://127.0.0.1:1", "ws://127.0.0.1:2"]);
 
         let h = svc.health(&admin).await.unwrap();
         assert_eq!(h.keys.len(), 1);
@@ -1179,5 +1241,123 @@ mod tests {
         assert!(r.message.contains("node key's default route"), "{}", r.message);
         svc.update_network(&admin, patch(json!({ "proxies": { "default": { "proxy": "up" } } })))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_remote_settings_off_no_admin_can_pick_a_proxy_to_connect_through() {
+        use deadhop_netengine::netruntime::{CheckProxyParams, ResolveI2pNameParams};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config("http://127.0.0.1:1", Kind::Lnd, dir.path());
+        cfg.sources = crate::settings::Sources::default();
+        cfg.socks5 = Some("socks5://127.0.0.1:1".into());
+        let svc = Service::new(cfg);
+        let admin = caller(&admin_keys());
+        assert!(svc.proxies_locked());
+        assert!(svc.get_network(&admin).unwrap().proxy_locked);
+        let net = &svc.net.runtime;
+        let raw = CheckProxyParams {
+            proxy: Some("socks5://10.9.9.9:1080".into()),
+            id: None,
+        };
+        let r = from_engine(net.check_proxy(&svc, &admin, raw).await.unwrap_err());
+        assert!(
+            r.message.contains(REMOTE_OFF) && r.message.contains("only the listed"),
+            "{}",
+            r.message
+        );
+        let name = ResolveI2pNameParams {
+            name: "example.i2p".into(),
+        };
+        let r = from_engine(net.resolve_i2p_name(&svc, &admin, name).await.unwrap_err());
+        assert!(r.message.contains(REMOTE_OFF), "{}", r.message);
+        // The configured proxy can still be tested.
+        let listed = CheckProxyParams {
+            proxy: None,
+            id: Some("socks5".into()),
+        };
+        assert_eq!(net.check_proxy(&svc, &admin, listed).await.unwrap().status, "failed");
+        assert_eq!(NetworkHost::audit_facts(&svc).lock_setting, REMOTE_OFF);
+    }
+
+    #[tokio::test]
+    async fn a_change_that_cannot_be_recorded_is_still_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config("http://127.0.0.1:1", Kind::Lnd, dir.path());
+        cfg.socks5 = Some("socks5://127.0.0.1:1".into());
+        let svc = Service::new(cfg);
+        let admin = caller(&admin_keys());
+        std::fs::create_dir(dir.path().join(AUDIT_FILE)).unwrap();
+        let r = svc
+            .update_network(
+                &admin,
+                patch(json!({
+                    "relays": ["ws://127.0.0.1:1", "ws://127.0.0.1:2"],
+                    "proxies": { "list": [{ "id": "other", "url": "socks5://127.0.0.1:2" }], "default": { "proxy": "other" } }
+                })),
+            )
+            .unwrap_err();
+        assert_eq!(r.code, code::INTERNAL);
+        // Applied, so the ways back are armed: new relays are checked, new proxies on probation.
+        assert_eq!(svc.net.settings().relays.len(), 2);
+        assert!(svc.restart_pending());
+        assert!(svc.net.runtime.pool.lock().unwrap().probation.is_some());
+        svc.restarted();
+        assert_eq!(svc.reset_network(&admin).unwrap_err().code, code::INTERNAL);
+        assert_eq!(svc.net.settings(), *svc.net.baseline());
+        assert!(svc.restart_pending());
+    }
+
+    #[test]
+    fn audit_entries_written_at_once_are_all_kept_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUDIT_FILE);
+        let threads: Vec<_> = (0..8u64)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..40 {
+                        let e = AuditEntry {
+                            at: t * 100 + i,
+                            actor: "a".into(),
+                            action: "x".into(),
+                            detail: "d".repeat(40),
+                        };
+                        append_audit(&path, &e, 2_000).unwrap();
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.len() <= 2_000);
+        for l in text.lines() {
+            serde_json::from_str::<AuditEntry>(l).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_proxies_are_the_configurations_even_when_saved_ones_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config("http://127.0.0.1:1", Kind::Lnd, dir.path());
+        cfg.proxy_locked = true;
+        let saved: NetworkFile = serde_json::from_value(json!({
+            "relay_names": { "ws://127.0.0.1:1": "one" },
+            "proxies": { "offline": "open" }
+        }))
+        .unwrap();
+        write_network(dir.path(), &saved).unwrap();
+        let svc = Service::new(cfg);
+        svc.load_network().unwrap();
+        assert_eq!(svc.net.settings().relay_names["ws://127.0.0.1:1"], "one");
+        assert_eq!(svc.net.settings().proxies, svc.net.baseline().proxies);
+        // Nor can a probation put other proxies back.
+        let mut other = svc.net.baseline().proxies.clone();
+        other.offline = OfflinePolicy::Open;
+        let host: &dyn NetworkHost = &svc;
+        assert_eq!(
+            from_engine(host.revert_proxies(other, "test").unwrap_err()).code,
+            code::LOCKED
+        );
+        assert_eq!(svc.net.settings().proxies, svc.net.baseline().proxies);
     }
 }

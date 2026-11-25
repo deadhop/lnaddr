@@ -33,7 +33,8 @@ const RELAY_WATCH_EVERY: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const RELAY_WATCH_EVERY: Duration = Duration::from_millis(250);
 /// How long no relay may be connected before the node goes back to the
-/// relays (and with them the proxy) from its configuration.
+/// relays from its configuration. (Only the relays: saved proxies stay, and
+/// with them the offline policy, so the kill switch still holds.)
 #[cfg(not(test))]
 const RELAY_DEAD_AFTER: Duration = Duration::from_secs(600);
 #[cfg(test)]
@@ -276,7 +277,10 @@ async fn supervise(
                 None => std::future::pending::<()>().await,
             }
         };
+        // In this order: a change of relays is remade (and checked) by the
+        // restart arm, never by a move of routes that happens to come first.
         tokio::select! {
+            biased;
             _ = stop.cancelled() => {
                 close(&mut link).await;
                 return;
@@ -301,7 +305,9 @@ async fn supervise(
                 // whose route changed: a relay a rule keeps on its proxy stays
                 // connected.
                 let want = svc.net.runtime.lane_routes(&*svc, LANE);
-                if want.as_ref() == link.as_ref().map(|l| &l.routes) {
+                // Other relays are the restart arm's: it checks that they
+                // connect and goes back if not.
+                if relay_setup(&svc) != live || want.as_ref() == link.as_ref().map(|l| &l.routes) {
                     continue;
                 }
                 tokio::time::sleep(RESTART_GRACE).await;
@@ -1047,8 +1053,15 @@ pub mod tests {
         .unwrap();
         let list: AddressList = gw2.call(proto::LIST_ADDRESSES, json!({})).await.unwrap();
         assert_eq!(list.addresses.len(), 2);
-        // A relay nothing answers on: back to the one that worked.
-        update(&svc, json!({ "relays": ["ws://127.0.0.1:9"] }));
+        // A remote list must keep a configured relay (the gateways' way in).
+        let p = serde_json::from_value(json!({ "patch": { "relays": ["ws://127.0.0.1:9"] } })).unwrap();
+        let r2 = svc.update_network(&caller(&admin_keys()), p).unwrap_err();
+        assert!(r2.message.contains("configured relays"), "{}", r2.message);
+        // Relays nothing answers on (as saved before that rule): back to the
+        // ones that worked.
+        svc.revert_connection(vec!["ws://127.0.0.1:9".into()], BTreeMap::new(), "test")
+            .unwrap();
+        svc.schedule_restart();
         eventually("the revert", Duration::from_secs(15), || {
             svc.net.settings().relays == both
         })
@@ -1061,12 +1074,40 @@ pub mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_route_move_leaves_new_relays_to_the_restart_that_checks_them() {
+        let r = node_rig(Kind::Lnd).await;
+        let node = start(r.cfg.clone()).await.unwrap();
+        let svc = node.svc.clone();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(node.relays_connected().await >= 1, "connected at first");
+        // New relays are live, and the proxy pool wakes first: it must not
+        // connect them, or the restart would find nothing to check.
+        let mut moved = svc.net.settings();
+        moved.relays = vec!["ws://127.0.0.1:9".into()];
+        svc.net.set(moved);
+        svc.net.runtime.pool_switch.notify_one();
+        tokio::time::sleep(RESTART_GRACE + Duration::from_millis(500)).await;
+        let states = deadhop_netengine::netruntime::NetworkHost::relay_states(&*svc).await;
+        assert!(states.iter().any(|s| s.connected), "{states:?}");
+        svc.schedule_restart();
+        eventually("the revert", Duration::from_secs(15), || {
+            svc.net.settings().relays == r.cfg.relays
+        })
+        .await;
+        assert_eq!(last_audit(&r.cfg.data_dir).1, "no relay connected with the new relays");
+        node.until(Box::pin(async {})).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn relays_that_die_give_way_to_the_configured_ones() {
         let r = node_rig(Kind::Lnd).await;
         let second = MockRelay::run().await.unwrap();
         let node = start(r.cfg.clone()).await.unwrap();
         let svc = node.svc.clone();
-        update(&svc, json!({ "relays": [second.url().await.to_string()] }));
+        // Saved relays without a configured one (as saved before that rule).
+        svc.revert_connection(vec![second.url().await.to_string()], BTreeMap::new(), "test")
+            .unwrap();
+        svc.schedule_restart();
         tokio::time::sleep(RESTART_GRACE + Duration::from_secs(1)).await;
         second.shutdown();
         eventually("the fallback", Duration::from_secs(20), || {
