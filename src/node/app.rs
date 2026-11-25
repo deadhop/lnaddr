@@ -980,6 +980,36 @@ pub mod tests {
         close(&mut link).await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_relays_that_cannot_even_start_are_reverted() {
+        let mut r = node_rig(Kind::Lnd).await;
+        r.cfg.socks5 = Some("socks5://127.0.0.1:1".into());
+        let svc = Arc::new(Service::new(r.cfg.clone()));
+        svc.net.runtime.pool.lock().unwrap().applied.insert(
+            LANE.into(),
+            Applied {
+                active: Some("socks5".into()),
+                active_url: Some("unusable".into()),
+                state: PoolState::Active,
+                next_switch_at: None,
+                reachable: 1,
+            },
+        );
+        let id = Ident {
+            keys: Keys::generate(),
+            allowed: Vec::new(),
+        };
+        let previous = relay_setup(&svc);
+        let mut moved = svc.net.settings();
+        moved.relays = vec!["ws://127.0.0.1:9".into()];
+        svc.net.set(moved);
+        std::fs::create_dir_all(&r.cfg.data_dir).unwrap();
+        // Neither the new relays nor the previous ones can start here: back
+        // to the previous ones, and the error.
+        assert!(relink(&id, &svc, previous.clone()).await.is_err());
+        assert_eq!(relay_setup(&svc), previous);
+    }
+
     #[tokio::test]
     async fn no_link_is_not_a_dead_link() {
         assert!(!dead(&None, Duration::ZERO).await);
