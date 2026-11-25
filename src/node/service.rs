@@ -14,8 +14,10 @@ use crate::bolt11::{self, Expect, Network};
 use crate::lnurl;
 use crate::node::backend::{Backend, Request};
 use crate::node::config::{self, Address, Config, Limits, Remote};
+use crate::node::network::NodeNet;
 use crate::proto::{self, code, AddressInfo, AddressList, ConfigView, MadeInvoice, MakeInvoiceParams, Status};
 use crate::ratelimit::RateLimiter;
+use deadhop_netengine::proxypool::Posture;
 
 /// How far a request's timestamp may be from the node's clock.
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -27,7 +29,22 @@ pub struct Refusal {
     pub message: String,
 }
 
-fn refuse(code: &'static str, message: impl Into<String>) -> Refusal {
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// A refusal as the text the command line and the supervisor report.
+impl From<Refusal> for String {
+    fn from(r: Refusal) -> String {
+        r.message
+    }
+}
+
+pub(crate) fn refuse(code: &'static str, message: impl Into<String>) -> Refusal {
     Refusal {
         code,
         message: message.into(),
@@ -38,7 +55,7 @@ fn refuse(code: &'static str, message: impl Into<String>) -> Refusal {
 pub use deadhop_cvm::caller::Caller;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
+pub(crate) enum Role {
     Gateway,
     Admin,
 }
@@ -54,6 +71,8 @@ struct Mutable {
 
 pub struct Service {
     cfg: Config,
+    /// Relays, proxies and their state (see [`crate::node::network`]).
+    pub net: NodeNet,
     backend: Backend,
     state: RwLock<Mutable>,
     permits: Semaphore,
@@ -65,7 +84,7 @@ pub struct Service {
     now: fn() -> u64,
 }
 
-fn network_name(n: Network) -> &'static str {
+pub(crate) fn network_name(n: Network) -> &'static str {
     match n {
         Network::Bitcoin => "bitcoin",
         Network::Testnet => "testnet",
@@ -95,6 +114,7 @@ impl Service {
             cfg.limits.per_caller_per_minute,
         ));
         Service {
+            net: NodeNet::new(&cfg),
             state: RwLock::new(Mutable {
                 addresses: cfg.addresses.clone(),
                 limits: cfg.limits.clone(),
@@ -116,6 +136,24 @@ impl Service {
         &self.cfg
     }
 
+    /// Seconds since the Unix epoch, by the node's clock.
+    pub fn clock(&self) -> u64 {
+        (self.now)()
+    }
+
+    /// The smallest and largest amounts the addresses take (in satoshis,
+    /// 0 to 0 with none), and how long an invoice stays payable.
+    pub(crate) fn amounts(&self) -> (u64, u64, u64) {
+        let s = self.read();
+        let min = s.addresses.values().map(|a| a.min_sendable.div_ceil(1000)).min();
+        let max = s.addresses.values().map(|a| a.max_sendable / 1000).max();
+        (
+            min.unwrap_or(0),
+            max.unwrap_or(0),
+            u64::from(s.limits.invoice_expiry_secs),
+        )
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Mutable> {
         self.state.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -124,12 +162,21 @@ impl Service {
         self.state.write().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Who the caller is, and whether its request is fresh.
-    fn role(&self, c: &Caller) -> Result<Role, Refusal> {
+    /// Who the caller is, and whether its request is fresh. While no proxy
+    /// is reachable, the offline policy decides who is served: under
+    /// "admins only" no gateway is, under "invoicing only" no admin is (a key
+    /// listed as both then acts as a gateway).
+    pub(crate) fn role(&self, c: &Caller) -> Result<Role, Refusal> {
         let key = c.pubkey.as_deref().and_then(|k| PublicKey::from_hex(k).ok());
+        let posture = self.net.runtime.posture(self);
         let role = match key {
-            Some(k) if self.cfg.admins.contains(&k) => Role::Admin,
-            Some(k) if self.cfg.gateways.contains(&k) => Role::Gateway,
+            Some(k) if self.cfg.admins.contains(&k) && posture != Posture::InvoicingOnly => Role::Admin,
+            Some(k) if self.cfg.gateways.contains(&k) => {
+                if posture == Posture::AdminOnly {
+                    return Err(refuse(code::UNAVAILABLE, "the node is not serving invoices now"));
+                }
+                Role::Gateway
+            }
             _ => return Err(refuse(code::UNAUTHORIZED, "this key may not use this node")),
         };
         // The signed event is what proves the request is fresh: without it
@@ -147,7 +194,7 @@ impl Service {
         Ok(role)
     }
 
-    fn admin(&self, c: &Caller) -> Result<(), Refusal> {
+    pub(crate) fn admin(&self, c: &Caller) -> Result<(), Refusal> {
         match self.role(c)? {
             Role::Admin => Ok(()),
             Role::Gateway => Err(refuse(code::UNAUTHORIZED, "admins only")),
@@ -435,6 +482,7 @@ pub mod tests {
             gateways: vec![gateway_keys().public_key()],
             admins: vec![admin_keys().public_key()],
             socks5: None,
+            proxy_locked: false,
             network: Network::Regtest,
             backend: BackendConfig {
                 kind,

@@ -4,4 +4,5 @@ pub mod app;
 pub mod backend;
 pub mod config;
 pub mod mcp;
+pub mod network;
 pub mod service;

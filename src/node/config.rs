@@ -1,12 +1,16 @@
 //! Node configuration: built-in values, a TOML file, environment variables
-//! and, when switched on, address and limit settings saved by an admin over
-//! ContextVM. See [`crate::settings`] for how the layers combine.
+//! and, when switched on, settings saved by an admin over ContextVM. See
+//! [`crate::settings`] for how the layers combine.
 //!
 //! Remote settings can only ever change the address table and the invoice
-//! limits. The backend (address, credential, certificate pin), the keys
-//! allowed to call, the relays and the data directory are host-only: a
-//! stolen admin key must not be able to point the node at another backend
-//! or let itself in.
+//! limits (`remote.toml`), and the relays and their proxies
+//! (`network.json`, see [`crate::node::network`]). The backend (address,
+//! credential, certificate pin), the keys allowed to call and the data
+//! directory are host-only: a stolen admin key must not be able to point
+//! the node at another backend or let itself in. The relays and proxy
+//! configured here stay the baseline: a reset goes back to them, and so does
+//! the node by itself when saved relays stay unreachable. `proxy_locked`
+//! keeps the proxies host-only too.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -133,6 +137,8 @@ pub struct Layer {
     pub gateways: Option<Vec<String>>,
     pub admins: Option<Vec<String>>,
     pub socks5: Option<String>,
+    /// The proxies can be changed on the host only.
+    pub proxy_locked: Option<bool>,
     pub network: Option<String>,
     pub backend: Option<BackendLayer>,
     pub limits: Option<LimitsLayer>,
@@ -223,7 +229,10 @@ pub struct Config {
     pub relays: Vec<String>,
     pub gateways: Vec<PublicKey>,
     pub admins: Vec<PublicKey>,
-    pub socks5: Option<crate::pool::ProxySpec>,
+    /// The proxy for relay connections, as a url.
+    pub socks5: Option<String>,
+    /// The proxies can be changed on the host only.
+    pub proxy_locked: bool,
     pub network: Network,
     pub backend: BackendConfig,
     pub limits: Limits,
@@ -236,7 +245,7 @@ fn merge(a: &mut Layer, b: Layer) {
     macro_rules! take {
         ($($f:ident),*) => { $( if b.$f.is_some() { a.$f = b.$f; } )* };
     }
-    take!(data_dir, relays, gateways, admins, socks5, network);
+    take!(data_dir, relays, gateways, admins, socks5, proxy_locked, network);
     if let Some(bb) = b.backend {
         let ab = a.backend.get_or_insert_with(Default::default);
         macro_rules! takeb {
@@ -298,12 +307,17 @@ fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
         Some(v) => Some(settings::flag("LNADDR_NODE_REMOTE", &v)?),
         None => None,
     };
+    let proxy_locked = match get("PROXY_LOCKED") {
+        Some(v) => Some(settings::flag("LNADDR_NODE_PROXY_LOCKED", &v)?),
+        None => None,
+    };
     Ok(Layer {
         data_dir: get("DATA_DIR").map(PathBuf::from),
         relays: get("RELAYS").map(|v| settings::list(&v)),
         gateways: get("GATEWAYS").map(|v| settings::list(&v)),
         admins: get("ADMINS").map(|v| settings::list(&v)),
         socks5: get("SOCKS5"),
+        proxy_locked,
         network: get("NETWORK"),
         backend: Some(backend),
         limits: None,
@@ -482,7 +496,7 @@ fn finish(layer: Layer, data_dir: PathBuf, sources: Sources) -> Result<Config, S
     if gateways.is_empty() && admins.is_empty() {
         return Err("gateways: set the gateway's public key (run `lnaddr-gateway pubkey` on the gateway)".into());
     }
-    let socks5 = layer.socks5.as_deref().map(settings::socks5).transpose()?;
+    let socks5 = layer.socks5.as_deref().map(settings::proxy_url).transpose()?;
     let network: Network = layer.network.as_deref().unwrap_or("bitcoin").parse()?;
     let backend = backend(layer.backend.unwrap_or_default())?;
     let mut limits = Limits::default();
@@ -500,6 +514,7 @@ fn finish(layer: Layer, data_dir: PathBuf, sources: Sources) -> Result<Config, S
         gateways,
         admins,
         socks5,
+        proxy_locked: layer.proxy_locked.unwrap_or(false),
         network,
         backend,
         limits,
@@ -567,6 +582,7 @@ pub mod tests {
 relays = ["ws://127.0.0.1:7777"]
 network = "regtest"
 socks5 = "127.0.0.1:9050"
+proxy_locked = true
 admins = ["{}"]
 [backend]
 kind = "lnd"
@@ -608,7 +624,8 @@ invoices_per_minute = 5
         assert_eq!(c.limits.invoices_per_minute, 5);
         assert_eq!(c.limits.concurrent, 2);
         assert_eq!(c.network, Network::Regtest);
-        assert_eq!(c.socks5.unwrap().port, 9050);
+        assert_eq!(c.socks5.as_deref(), Some("socks5://127.0.0.1:9050"));
+        assert!(c.proxy_locked);
         assert_eq!(c.admins.len(), 1);
         // File and environment addresses add up, per name.
         assert_eq!(c.addresses.keys().collect::<Vec<_>>(), ["alice", "bob", "carol"]);
@@ -709,6 +726,7 @@ description = "Only"
             ("LNADDR_NODE_BACKEND_TIMEOUT_SECS", "soon", "not a valid number"),
             ("LNADDR_NODE_BACKEND_INSECURE_HTTP", "maybe", "not on or off"),
             ("LNADDR_NODE_REMOTE", "maybe", "not on or off"),
+            ("LNADDR_NODE_PROXY_LOCKED", "maybe", "not on or off"),
             ("LNADDR_NODE_ADDRESSES", "Alice", "names are 1 to 64"),
             ("LNADDR_NODE_CONFIG", "/does/not/exist", "/does/not/exist"),
         ];
