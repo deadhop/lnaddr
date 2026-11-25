@@ -35,7 +35,9 @@ LNADDR_NODE_BACKEND_TLS_CERT_FILE=tls.cert LNADDR_NODE_GATEWAYS=npub1gw… \
 LNADDR_NODE_ADDRESSES=you lnaddr-node
 ```
 
-Configuration comes from built-in values (`LNADDR_NODE_BUILTIN` / `LNADDR_GATEWAY_BUILTIN` at build time), a TOML file (`--config`), environment variables, and (node, opt-in) address and limit changes from an admin key over ContextVM. Any layer can lock later ones out.
+Configuration comes from built-in values (`LNADDR_NODE_BUILTIN` / `LNADDR_GATEWAY_BUILTIN` at build time), a TOML file (`--config`), environment variables, and (node, opt-in) address, limit, relay and proxy changes from an admin key over ContextVM. Any layer can lock later ones out.
+
+The node's relay connections run on deadhop's network engine (`server/crates/netengine`): routing rules, proxy groups, relay health and the privacy audit, managed from the standalone network console (`console/`) with an admin key. The gateway is unchanged.
 
 ## Try it without a Lightning node
 
@@ -56,7 +58,7 @@ cargo llvm-cov --all-targets --fail-under-lines 100 --fail-under-functions 100
 
 | Path | What |
 | --- | --- |
-| `src/node/` | node service: config layers, backends, the MCP tools, the request loop and CLI |
+| `src/node/` | node service: config layers, backends, the MCP tools, the network (relays and proxies on the network engine, `network.json`, `audit.jsonl`), the request loop and CLI |
 | `src/gateway/` | gateway: config, node directory and cache, public HTTP, admin web, CLI |
 | `src/lnurl.rs`, `src/bolt11.rs` | LUD-06/12/16 and invoice checks shared by both |
 | `src/pool.rs`, `src/cvm.rs`, `src/handshake.rs` | relay pool (first OK wins), stateless ContextVM client, local MCP handshake |
