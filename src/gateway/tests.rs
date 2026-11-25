@@ -735,7 +735,25 @@ async fn the_admin_signs_in_and_changes_addresses_on_the_node() {
     assert_eq!(b.get("/assets/nope").await.status, 404);
     assert!(b.get("/nowhere").await.body.contains("Not found."));
 
-    let p = b.post("/logout", &[], None).await;
+    // Another site cannot sign the operator out: without the token, or from
+    // another origin, the post is refused and the session lives on.
+    assert_eq!(b.post("/logout", &[], None).await.status, 403);
+    assert_eq!(
+        b.post("/logout", &[("csrf", &csrf)], Some("https://evil.example"))
+            .await
+            .status,
+        403
+    );
+    assert_eq!(b.get("/").await.status, 200);
+    // The sign-out form on every page carries the token.
+    let overview = b.get("/").await.body;
+    assert!(
+        overview.contains(&format!(
+            "action=\"/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">"
+        )),
+        "{overview}"
+    );
+    let p = b.post("/logout", &[("csrf", &csrf)], None).await;
     assert!(p.set_cookie.unwrap().contains("Max-Age=0"));
     assert_eq!(b.get("/").await.location.as_deref(), Some("/login"));
     // Without a session, form posts go to the sign-in page.
