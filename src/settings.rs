@@ -123,14 +123,24 @@ pub use deadhop_net::hosts::{is_loopback_host, is_overlay_host};
 /// The proxy for relay connections: `host:port` (SOCKS5), or a
 /// `socks5://`, `http://` or `https://` url (HTTP CONNECT for the last two).
 pub fn socks5(s: &str) -> Result<ProxySpec, String> {
+    let url = proxy_url(s)?;
+    Ok(deadhop_net::relay::parse_proxy(&url)
+        .ok()
+        .flatten()
+        .expect("a checked proxy url parses"))
+}
+
+/// The same proxy as a url (a bare `host:port` becomes `socks5://host:port`),
+/// once it has been checked.
+pub fn proxy_url(s: &str) -> Result<String, String> {
     let s = s.trim();
     let url = if s.contains("://") {
         s.to_string()
     } else {
         format!("socks5://{s}")
     };
-    let spec = deadhop_net::relay::parse_proxy(&url).map_err(|e| format!("proxy {s:?}: {e}"))?;
-    spec.ok_or(format!("proxy {s:?} is empty"))
+    deadhop_net::relay::parse_proxy(&url).map_err(|e| format!("proxy {s:?}: {e}"))?;
+    Ok(url)
 }
 
 /// A secret is never printed: only whether it is set.
@@ -228,5 +238,8 @@ mod tests {
         assert_eq!(socks5("https://proxy.example:443").unwrap().kind, ProxyKind::Https);
         assert!(socks5("ftp://h:1").unwrap_err().contains("scheme must be"));
         assert!(socks5("socks5://h").unwrap_err().contains("port"));
+        assert_eq!(proxy_url(" 10.0.0.1:1080 ").unwrap(), "socks5://10.0.0.1:1080");
+        assert_eq!(proxy_url("socks5h://tor:9050").unwrap(), "socks5h://tor:9050");
+        assert!(proxy_url("").unwrap_err().contains("host"));
     }
 }

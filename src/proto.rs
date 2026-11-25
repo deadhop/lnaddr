@@ -177,6 +177,8 @@ pub mod code {
     pub const BUSY: &str = "busy";
     pub const BACKEND: &str = "backend_failed";
     pub const LOCKED: &str = "locked";
+    /// The node serves only admins now (no proxy is reachable).
+    pub const UNAVAILABLE: &str = "unavailable";
     pub const INTERNAL: &str = "internal";
 }
 

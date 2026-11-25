@@ -1218,7 +1218,7 @@ async fn a_lightning_address_works_through_a_socks5_or_an_http_connect_proxy() {
     ] {
         let proxy = crate::settings::socks5(&url).unwrap();
         let mut rig = crate::node::app::tests::node_rig(Kind::Lnd).await;
-        rig.cfg.socks5 = Some(proxy.clone());
+        rig.cfg.socks5 = Some(url.clone());
         let s = stack_on(rig, |c| c.socks5 = Some(proxy)).await;
         let (status, params) = s.get("/.well-known/lnurlp/alice").await;
         assert_eq!(status, 200, "{url}: {params}");

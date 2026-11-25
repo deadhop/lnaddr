@@ -90,6 +90,13 @@ impl NodeClient {
         self.service.cancellation_token()
     }
 
+    /// The names of the tools the node shows this caller (every page).
+    #[cfg(test)]
+    pub async fn tool_names(&self) -> Result<Vec<String>, ServiceError> {
+        let tools = self.service.list_all_tools().await?;
+        Ok(tools.into_iter().map(|t| t.name.to_string()).collect())
+    }
+
     /// How many relays are connected.
     pub async fn relays_connected(&self) -> usize {
         crate::pool::connected(&self.pool).await
