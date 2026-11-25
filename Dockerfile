@@ -29,7 +29,8 @@ ENV LNADDR_NODE_DATA_DIR=/data
 VOLUME ["/data"]
 ENTRYPOINT ["/lnaddr-node"]
 
-# On the public host, behind any reverse proxy.
+# On the public host, behind any reverse proxy. /data keeps its keys, and
+# network.json and audit.jsonl when its admins manage its relays.
 FROM scratch AS gateway
 COPY --from=build /out/lnaddr-gateway /lnaddr-gateway
 COPY --from=build --chown=10001:10001 /out/data /data

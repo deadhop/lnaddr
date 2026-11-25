@@ -1,5 +1,6 @@
 //! Running the gateway and the `lnaddr-gateway` command line.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -13,18 +14,30 @@ use tokio_util::sync::CancellationToken;
 use crate::gateway::admin::{self, Admin};
 use crate::gateway::config::{self, Config, Listen, ADMIN_KEY_FILE, KEY_FILE, TOKEN_FILE};
 use crate::gateway::http::{self, Public};
+use crate::gateway::network::{Network, ADMIN_LANE, GATEWAY_LANE};
 use crate::gateway::nodes::{Directory, NodeLink};
 use crate::gateway::server;
+use crate::gateway::supervise::{close, connect, dead, fall_back, or_log, relay_setup, supervise, Ident, Supervised};
+use crate::gateway::supervise::{DEAD_AT_START, RELAY_CHECK, RELAY_HEALTH_EVERY};
 use crate::proto::{self, ConfigView, Status};
 
 pub struct Gateway {
     pub keys: Keys,
     pub dir: Arc<Directory>,
+    pub net: Arc<Network>,
     pub public: Listen,
     pub admin: Option<Listen>,
+    /// The key the network console signs in to (`admin.key`), when `admins` are set.
+    pub console: Option<Keys>,
     admin_state: Option<Arc<Admin>>,
     stop: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
+    supervisor: JoinHandle<()>,
+    /// The proxy probe loop (tests stop it to plan routes by hand).
+    pub(crate) probe: JoinHandle<()>,
+    /// Cancels the console's current request loop (tests use it to simulate a crash).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) current: Arc<std::sync::Mutex<CancellationToken>>,
 }
 
 /// The admin token, created on first use.
@@ -53,10 +66,25 @@ pub fn admin_keys(data_dir: &std::path::Path) -> Result<Option<Keys>, String> {
 pub async fn start(cfg: Config) -> Result<Gateway, String> {
     crate::files::open_dir(&cfg.data_dir)?;
     let keys = crate::files::load_or_create_keys(&cfg.data_dir.join(KEY_FILE))?;
+    // With admins listed, the admin key is also the console's way in: made now.
+    let admin_key = if cfg.admins.is_empty() {
+        admin_keys(&cfg.data_dir)?
+    } else {
+        Some(crate::files::load_or_create_keys(&cfg.data_dir.join(ADMIN_KEY_FILE))?)
+    };
+    let net = Arc::new(Network::new(cfg.clone()));
+    net.load_network();
+    net.set_pubkey(GATEWAY_LANE, &keys.public_key().to_hex());
+    if let Some(k) = &admin_key {
+        net.set_pubkey(ADMIN_LANE, &k.public_key().to_hex());
+    }
+    // Look at the proxies before connecting anything, so that no relay is
+    // ever reached the wrong way round.
+    net.runtime.refresh_pool(&*net).await;
     let dir = Arc::new(Directory::new(
         cfg.nodes.clone(),
         keys.clone(),
-        cfg.socks5.clone(),
+        net.clone(),
         cfg.limits.timeout,
     ));
     let stop = CancellationToken::new();
@@ -68,6 +96,31 @@ pub async fn start(cfg: Config) -> Result<Gateway, String> {
         None => None,
     };
     let admin = admin_bound.as_ref().map(server::Bound::local);
+    let console = admin_key.clone().filter(|_| !cfg.admins.is_empty());
+    let id = console.clone().map(|keys| Ident {
+        keys,
+        allowed: cfg.admins.iter().map(|k| k.to_hex()).collect(),
+    });
+    let saved = relay_setup(&net) != (net.baseline().relays.clone(), BTreeMap::new());
+    // A console server that cannot start leaves the LNURL side serving; the
+    // supervisor tries it again.
+    let mut link = or_log(
+        &net,
+        connect(&id, &net, &dir).await,
+        "could not start the console server",
+    );
+    // Saved relays the console or the gateway key reaches nothing on would
+    // leave it unmanageable or without invoices, and a restart would not
+    // help: back to the configured ones.
+    if saved && (dead(&link, RELAY_CHECK).await || !dir.any_connects_within(RELAY_CHECK).await) {
+        tracing::warn!("no saved relay connected; using the configured relays");
+        close(&mut link).await;
+        link = or_log(
+            &net,
+            fall_back(&id, &net, &dir, DEAD_AT_START).await,
+            "could not go back to the configured relays",
+        );
+    }
     // Keep the cache warm: refresh now, then every cache period.
     tasks.push(tokio::spawn({
         let (dir, stop, every) = (dir.clone(), stop.clone(), cfg.limits.cache);
@@ -93,8 +146,9 @@ pub async fn start(cfg: Config) -> Result<Gateway, String> {
         let state = Arc::new(Admin::new(
             cfg.clone(),
             dir.clone(),
+            net.clone(),
             admin_token(&cfg.data_dir)?,
-            admin_keys(&cfg.data_dir)?,
+            admin_key,
         ));
         tasks.push(tokio::spawn(server::serve(
             bound,
@@ -104,14 +158,46 @@ pub async fn start(cfg: Config) -> Result<Gateway, String> {
         )));
         admin_state = Some(state);
     }
+    let current = Arc::new(std::sync::Mutex::new(CancellationToken::new()));
+    let supervisor = tokio::spawn(supervise(
+        Supervised {
+            net: net.clone(),
+            dir: dir.clone(),
+            id,
+            current: current.clone(),
+        },
+        link,
+        stop.clone(),
+    ));
+    let probe = tokio::spawn({
+        let (net, stop) = (net.clone(), stop.clone());
+        async move { deadhop_netengine::proxypool::run_probe_loop(&net.runtime, &*net, stop).await }
+    });
+    tasks.push(tokio::spawn({
+        let (net, stop) = (net.clone(), stop.clone());
+        async move {
+            loop {
+                net.runtime.refresh_relay_health(&*net).await;
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(RELAY_HEALTH_EVERY) => {}
+                }
+            }
+        }
+    }));
     Ok(Gateway {
         keys,
         dir,
+        net,
         public,
         admin,
+        console,
         admin_state,
         stop,
         tasks,
+        supervisor,
+        probe,
+        current,
     })
 }
 
@@ -119,6 +205,8 @@ impl Gateway {
     pub async fn until(self, shutdown: crate::Shutdown) {
         shutdown.await;
         self.stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.supervisor).await;
+        let _ = self.probe.await;
         for t in self.tasks {
             let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
         }
@@ -177,13 +265,14 @@ fn node_index(cfg: &Config, arg: Option<&String>) -> Result<usize, String> {
     Ok(n - 1)
 }
 
-fn admin_link(cfg: &Config, i: usize) -> Result<NodeLink, String> {
+async fn admin_link(cfg: &Config, i: usize) -> Result<NodeLink, String> {
     let keys = admin_keys(&cfg.data_dir)?
         .ok_or("no admin key yet: run `lnaddr-gateway admin-pubkey` and add the key to the node's admins")?;
     Ok(NodeLink::new(
         cfg.nodes[i].clone(),
         keys,
-        cfg.socks5.clone(),
+        ADMIN_LANE,
+        Network::for_command(cfg).await,
         cfg.limits.timeout,
     ))
 }
@@ -226,7 +315,7 @@ fn print_view(out: &mut dyn Write, v: &ConfigView) {
 async fn node_command(cfg: &Config, args: &[String], out: &mut dyn Write) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
     let i = node_index(cfg, args.get(1))?;
-    let link = admin_link(cfg, i)?;
+    let link = admin_link(cfg, i).await?;
     let num = |s: &String| {
         s.replace([',', '_'], "")
             .parse::<u64>()
@@ -288,7 +377,7 @@ async fn status_command(cfg: &Config, out: &mut dyn Write) -> Result<(), String>
     let dir = Directory::new(
         cfg.nodes.clone(),
         own_keys(cfg)?,
-        cfg.socks5.clone(),
+        Network::for_command(cfg).await,
         cfg.limits.timeout,
     );
     let started = Instant::now();
@@ -354,7 +443,7 @@ async fn test_command(cfg: &Config, args: &[String], out: &mut dyn Write) -> Res
     let dir = Directory::new(
         cfg.nodes.clone(),
         own_keys(cfg)?,
-        cfg.socks5.clone(),
+        Network::for_command(cfg).await,
         cfg.limits.timeout,
     );
     let started = Instant::now();

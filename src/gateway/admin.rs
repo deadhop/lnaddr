@@ -22,6 +22,7 @@ use serde_json::json;
 
 use crate::cvm::CallError;
 use crate::gateway::config::Config;
+use crate::gateway::network::{Network, ADMIN_LANE};
 use crate::gateway::nodes::{Directory, NodeLink};
 use crate::gateway::server::Peer;
 use crate::proto::{self, ConfigView, Status};
@@ -231,7 +232,13 @@ pub struct NodeQuery {
 }
 
 impl Admin {
-    pub fn new(cfg: Config, dir: Arc<Directory>, token: String, admin_keys: Option<nostr_sdk::Keys>) -> Self {
+    pub fn new(
+        cfg: Config,
+        dir: Arc<Directory>,
+        net: Arc<Network>,
+        token: String,
+        admin_keys: Option<nostr_sdk::Keys>,
+    ) -> Self {
         use nostr_sdk::ToBech32;
         let admin_npub = admin_keys
             .as_ref()
@@ -239,7 +246,7 @@ impl Admin {
         let links = admin_keys.map(|k| {
             cfg.nodes
                 .iter()
-                .map(|n| NodeLink::new(n.clone(), k.clone(), cfg.socks5.clone(), cfg.limits.timeout))
+                .map(|n| NodeLink::new(n.clone(), k.clone(), ADMIN_LANE, net.clone(), cfg.limits.timeout))
                 .collect()
         });
         Admin {
@@ -809,13 +816,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::gateway::tests::gateway_config_for(vec![node], dir.path());
         cfg.limits.timeout = Duration::from_secs(1);
+        let net = Arc::new(Network::new(cfg.clone()));
         let d = Arc::new(Directory::new(
             cfg.nodes.clone(),
             nostr_sdk::Keys::generate(),
-            None,
+            net.clone(),
             cfg.limits.timeout,
         ));
-        Admin::new(cfg, d, "t".into(), None)
+        Admin::new(cfg, d, net, "t".into(), None)
     }
 
     fn with_cookie(id: &str) -> HeaderMap {

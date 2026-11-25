@@ -4,7 +4,10 @@ pub mod admin;
 pub mod app;
 pub mod config;
 pub mod http;
+pub mod mcp;
+pub mod network;
 pub mod nodes;
 pub mod server;
+pub mod supervise;
 #[cfg(test)]
 mod tests;
