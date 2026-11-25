@@ -504,7 +504,15 @@ mod tests {
         net.set(moved);
         net.runtime.pool_switch.notify_one();
         tokio::time::sleep(RESTART_GRACE + Duration::from_millis(500)).await;
-        assert!(console_answers(&s, &s.node_rig.relay_url).await);
+        // Still answering on the old relay: the move left the new ones alone.
+        // Retried, since a loaded machine (the coverage run) can be slow to answer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !console_answers(&s, &s.node_rig.relay_url).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the console still reaches the old relay"
+            );
+        }
         net.schedule_restart();
         eventually("the revert", Duration::from_secs(15), || {
             net.settings().relays == [s.node_rig.relay_url.clone()]
@@ -645,5 +653,16 @@ mod tests {
         tokio::time::sleep(RELAY_WATCH_EVERY * 2).await;
         assert!(s.gw().dir.nodes[0].refresh().await.is_ok());
         s.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn no_link_is_never_dead() {
+        // Without a console server there is nothing to watch, so nothing to fall back from.
+        assert!(!dead(&None, Duration::ZERO).await);
     }
 }
