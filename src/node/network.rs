@@ -446,7 +446,7 @@ impl NetworkHost for Service {
     }
 }
 
-fn copy(e: &RelayEventRow) -> RelayEventRow {
+pub(crate) fn copy(e: &RelayEventRow) -> RelayEventRow {
     RelayEventRow {
         at: e.at,
         relay: e.relay.clone(),
@@ -457,7 +457,7 @@ fn copy(e: &RelayEventRow) -> RelayEventRow {
 }
 
 /// A patch that sets every proxy setting to `s`.
-fn whole(s: &ProxySettings) -> ProxyPatch {
+pub(crate) fn whole(s: &ProxySettings) -> ProxyPatch {
     ProxyPatch {
         list: ProxyPatch::with_list(&s.list).list,
         groups: Some(s.groups.clone()),
@@ -471,9 +471,25 @@ fn whole(s: &ProxySettings) -> ProxyPatch {
     }
 }
 
+/// A change as the audit log records it: proxy passwords hidden.
+pub(crate) fn audit_detail(patch: NetworkPatch) -> String {
+    let mut shown = NetworkFile {
+        relays: patch.relays,
+        relay_keys: patch.relay_keys,
+        relay_names: patch.relay_names,
+        proxies: patch.proxies,
+    };
+    if let Some(px) = &mut shown.proxies {
+        for e in px.list.iter_mut().flatten() {
+            e.url = deadhop_net::relay::redact(&e.url);
+        }
+    }
+    serde_json::to_string(&shown).expect("patches always serialise")
+}
+
 /// Check the relays an admin sends: one to [`MAX_RELAYS`], each a relay the
 /// node can use, none twice.
-fn check_relays(relays: &[String]) -> Result<(), Refusal> {
+pub(crate) fn check_relays(relays: &[String]) -> Result<(), Refusal> {
     if relays.is_empty() || relays.len() > MAX_RELAYS {
         return Err(refuse(code::INVALID, format!("relays: 1 to {MAX_RELAYS} are needed")));
     }
@@ -685,18 +701,7 @@ impl Service {
         let relays_changed = next.relays != before.relays || next.relay_keys != before.relay_keys;
         self.save(&mut stored, next_file)?;
         drop(stored);
-        let mut shown = NetworkFile {
-            relays: patch.relays,
-            relay_keys: patch.relay_keys,
-            relay_names: patch.relay_names,
-            proxies: patch.proxies,
-        };
-        if let Some(px) = &mut shown.proxies {
-            for e in px.list.iter_mut().flatten() {
-                e.url = deadhop_net::relay::redact(&e.url);
-            }
-        }
-        let detail = serde_json::to_string(&shown).expect("patches always serialise");
+        let detail = audit_detail(patch);
         // Applied: the checks that undo a bad change run whatever happens to
         // the audit log, which is reported after them.
         if relays_changed {

@@ -41,6 +41,8 @@ pub fn gateway_config_for(nodes: Vec<NodeConfig>, data: &std::path::Path) -> Con
         scheme_override: Some("http".into()),
         trusted_proxies: vec![],
         socks5: None,
+        proxy_locked: false,
+        admins: vec![console_keys().public_key()],
         nodes,
         limits: Limits {
             per_ip_per_minute: 1000,
@@ -51,8 +53,23 @@ pub fn gateway_config_for(nodes: Vec<NodeConfig>, data: &std::path::Path) -> Con
         },
         admin_listen: Some(Listen::Tcp("127.0.0.1:0".parse().unwrap())),
         secure_cookie: false,
-        sources: Sources::default(),
+        sources: remote_on(),
     }
+}
+
+/// Sources with remote settings on.
+pub fn remote_on() -> Sources {
+    let mut s = Sources::default();
+    s.apply(&crate::settings::SourcesLayer {
+        remote: Some(true),
+        ..Default::default()
+    });
+    s
+}
+
+/// The key that signs in to the gateway's console server in tests.
+pub fn console_keys() -> Keys {
+    Keys::parse(&"44".repeat(32)).unwrap()
 }
 
 /// Write the gateway's keys where the node expects them (the test keys).
@@ -820,7 +837,9 @@ async fn sign_in_attempts_are_limited() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn without_an_admin_key_the_interface_is_read_only() {
+    // With no console admins, the admin key is not made either.
     let s = stack_with(Kind::Lnd, |c| {
+        c.admins.clear();
         let _ = std::fs::remove_file(c.data_dir.join(crate::gateway::config::ADMIN_KEY_FILE));
     })
     .await;
@@ -1216,10 +1235,9 @@ async fn a_lightning_address_works_through_a_socks5_or_an_http_connect_proxy() {
         format!("socks5://127.0.0.1:{socks}"),
         format!("http://127.0.0.1:{connect}"),
     ] {
-        let proxy = crate::settings::socks5(&url).unwrap();
         let mut rig = crate::node::app::tests::node_rig(Kind::Lnd).await;
         rig.cfg.socks5 = Some(url.clone());
-        let s = stack_on(rig, |c| c.socks5 = Some(proxy)).await;
+        let s = stack_on(rig, |c| c.socks5 = Some(url.clone())).await;
         let (status, params) = s.get("/.well-known/lnurlp/alice").await;
         assert_eq!(status, 200, "{url}: {params}");
         let path = params["callback"]

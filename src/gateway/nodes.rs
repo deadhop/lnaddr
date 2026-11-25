@@ -17,12 +17,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::{Keys, ToBech32};
+use rmcp::schemars::{self, JsonSchema};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::bolt11::{self, Expect, Network};
 use crate::cvm::{CallError, NodeClient};
 use crate::gateway::config::NodeConfig;
+use crate::gateway::network::{Conn, Network as Net, GATEWAY_LANE};
 use crate::lnurl;
 use crate::proto::{self, code, AddressInfo, AddressList, MadeInvoice};
 
@@ -71,7 +73,7 @@ fn write<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 }
 
 /// What the gateway knows about one node right now.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct Health {
     pub npub: String,
     pub reachable: bool,
@@ -89,19 +91,24 @@ struct Snapshot {
     at: Instant,
 }
 
+/// A live client and the relay pool it runs on.
+type Client = (Arc<NodeClient>, Arc<Conn>);
+
 pub struct NodeLink {
     pub cfg: NodeConfig,
     keys: Keys,
-    socks5: Option<crate::pool::ProxySpec>,
+    /// The lane (key) it calls with, and the network that routes it.
+    lane: &'static str,
+    net: Arc<Net>,
     timeout: Duration,
-    client: tokio::sync::Mutex<Option<Arc<NodeClient>>>,
+    client: tokio::sync::Mutex<Option<Client>>,
     cache: RwLock<Option<Snapshot>>,
     last_refresh_try: Mutex<Option<Instant>>,
     health: Mutex<Health>,
 }
 
 impl NodeLink {
-    pub fn new(cfg: NodeConfig, keys: Keys, socks5: Option<crate::pool::ProxySpec>, timeout: Duration) -> Self {
+    pub fn new(cfg: NodeConfig, keys: Keys, lane: &'static str, net: Arc<Net>, timeout: Duration) -> Self {
         let health = Health {
             npub: cfg.pubkey.to_bech32().expect("keys encode"),
             ..Default::default()
@@ -109,7 +116,8 @@ impl NodeLink {
         NodeLink {
             cfg,
             keys,
-            socks5,
+            lane,
+            net,
             timeout,
             client: tokio::sync::Mutex::new(None),
             cache: RwLock::new(None),
@@ -118,15 +126,23 @@ impl NodeLink {
         }
     }
 
+    /// The client, made on the lane's routes now if there is none or the
+    /// network moved the one there was off its relays.
     async fn client(&self) -> Result<Arc<NodeClient>, CallError> {
         let mut slot = self.client.lock().await;
-        if let Some(c) = slot.as_ref() {
-            return Ok(c.clone());
+        if let Some((c, conn)) = slot.as_ref() {
+            if !conn.stale() {
+                return Ok(c.clone());
+            }
+            close_client(slot.take()).await;
         }
-        let (keys, node, relays) = (self.keys.clone(), &self.cfg.pubkey, &self.cfg.relays);
-        let connected = NodeClient::connect(keys, node, relays, self.socks5.clone(), self.timeout).await;
-        let c = Arc::new(connected.map_err(CallError::Closed)?);
-        *slot = Some(c.clone());
+        let (c, conn) = self
+            .net
+            .connect_node(self.lane, self.keys.clone(), &self.cfg, self.timeout)
+            .await
+            .map_err(CallError::Closed)?;
+        let c = Arc::new(c);
+        *slot = Some((c.clone(), conn));
         Ok(c)
     }
 
@@ -139,7 +155,7 @@ impl NodeLink {
         let started = Instant::now();
         let mut outcome = self.client().await?.call_value(tool, args.clone()).await;
         if matches!(outcome, Err(CallError::Closed(_))) {
-            *self.client.lock().await = None;
+            close_client(self.client.lock().await.take()).await;
             outcome = self.client().await?.call_value(tool, args).await;
         }
         let mut h = lock(&self.health);
@@ -202,7 +218,7 @@ impl NodeLink {
             h.payee = s.list.payee.clone();
         }
         let client = self.client.lock().await.clone();
-        if let Some(c) = client {
+        if let Some((c, _)) = client {
             h.relays_connected = c.relays_connected().await;
         }
         h
@@ -216,11 +232,15 @@ impl NodeLink {
     }
 
     pub async fn close(&self) {
-        // Only the last holder closes it; a call still in flight keeps it alive.
-        let last = self.client.lock().await.take().and_then(|c| Arc::try_unwrap(c).ok());
-        if let Some(c) = last {
-            c.close().await;
-        }
+        close_client(self.client.lock().await.take()).await;
+    }
+}
+
+/// Close a client. Only the last holder closes it; a call still in flight
+/// keeps it alive.
+async fn close_client(client: Option<Client>) {
+    if let Some(c) = client.and_then(|(c, _)| Arc::try_unwrap(c).ok()) {
+        c.close().await;
     }
 }
 
@@ -290,17 +310,43 @@ pub struct Directory {
 const MISS_REFRESH_GAP: Duration = Duration::from_secs(10);
 
 impl Directory {
-    pub fn new(nodes: Vec<NodeConfig>, keys: Keys, socks5: Option<crate::pool::ProxySpec>, timeout: Duration) -> Self {
+    /// The nodes, called with `keys` on the gateway lane of `net`.
+    pub fn new(nodes: Vec<NodeConfig>, keys: Keys, net: Arc<Net>, timeout: Duration) -> Self {
         // Each call gets a share of the request's deadline so a retry still fits.
         let per_call = timeout.mul_f64(0.45);
         Directory {
             nodes: nodes
                 .into_iter()
-                .map(|n| NodeLink::new(n, keys.clone(), socks5.clone(), per_call))
+                .map(|n| NodeLink::new(n, keys.clone(), GATEWAY_LANE, net.clone(), per_call))
                 .collect(),
             metrics: Metrics::default(),
             timeout,
         }
+    }
+
+    /// The bitcoin network the nodes report (the first one heard from).
+    pub fn chain(&self) -> Option<String> {
+        self.nodes
+            .iter()
+            .find_map(|n| read(&n.cache).as_ref().map(|s| s.list.network.clone()))
+    }
+
+    /// The smallest and largest amounts the nodes' addresses take, in
+    /// satoshis (0 to 0 before any node was heard from).
+    pub fn amounts(&self) -> (u64, u64) {
+        let all: Vec<AddressInfo> = self.nodes.iter().flat_map(NodeLink::addresses).collect();
+        let min = all.iter().map(|a| a.min_sendable.div_ceil(1000)).min();
+        let max = all.iter().map(|a| a.max_sendable / 1000).max();
+        (min.unwrap_or(0), max.unwrap_or(0))
+    }
+
+    /// How every node answered lately.
+    pub async fn healths(&self) -> Vec<Health> {
+        let mut out = Vec::new();
+        for n in &self.nodes {
+            out.push(n.health().await);
+        }
+        out
     }
 
     pub async fn refresh_all(&self) {
@@ -484,7 +530,12 @@ mod tests {
             relays: vec!["ws://127.0.0.1:9".into()],
             payee: None,
         };
-        let link = NodeLink::new(cfg, Keys::generate(), None, Duration::from_secs(1));
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(Net::new(crate::gateway::tests::gateway_config_for(
+            vec![cfg.clone()],
+            dir.path(),
+        )));
+        let link = NodeLink::new(cfg, Keys::generate(), GATEWAY_LANE, net, Duration::from_secs(1));
         let h = link.health().await;
         assert_eq!((h.relays_connected, h.reachable, h.addresses), (0, false, 0));
         assert!(link.addresses().is_empty());

@@ -67,7 +67,16 @@ impl NodeClient {
         socks5: Option<crate::pool::ProxySpec>,
         timeout: Duration,
     ) -> Result<Self, String> {
-        let pool = Arc::new(Pool::new(keys, socks5));
+        Self::on_pool(Arc::new(Pool::new(keys, socks5)), node, relays, timeout).await
+    }
+
+    /// A client on a relay pool made by the caller (a routed one, say).
+    pub async fn on_pool(
+        pool: Arc<Pool>,
+        node: &PublicKey,
+        relays: &[String],
+        timeout: Duration,
+    ) -> Result<Self, String> {
         let config = NostrClientTransportConfig::default()
             .with_relay_urls(relays.to_vec())
             .with_server_pubkey(node.to_hex())

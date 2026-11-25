@@ -1,5 +1,11 @@
 //! Gateway configuration: built-in values, a TOML file, then environment
-//! variables (see [`crate::settings`]). The gateway has no remote settings.
+//! variables (see [`crate::settings`]).
+//!
+//! The only remote settings the gateway has are its relays and their proxies
+//! (`network.json`, see [`crate::gateway::network`]), changed by the keys in
+//! `admins` over ContextVM while `sources.remote` is on. Everything here stays
+//! the baseline: the nodes and their relays, the domains, the listeners, the
+//! admin keys. `proxy_locked` keeps the proxies host-only too.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -136,6 +142,11 @@ pub struct Layer {
     pub trusted_proxies: Option<Vec<String>>,
     pub relays: Option<Vec<String>>,
     pub socks5: Option<String>,
+    /// The proxies can be changed on the host only.
+    pub proxy_locked: Option<bool>,
+    /// The keys (hex or npub) that may manage the gateway's network over
+    /// ContextVM, from the network console.
+    pub admins: Option<Vec<String>>,
     pub nodes: Option<Vec<NodeLayer>>,
     pub limits: Option<LimitsLayer>,
     pub admin: Option<AdminLayer>,
@@ -166,7 +177,12 @@ pub struct Config {
     pub domains: Vec<String>,
     pub scheme_override: Option<String>,
     pub trusted_proxies: Vec<Net>,
-    pub socks5: Option<crate::pool::ProxySpec>,
+    /// The proxy for relay connections, as a url.
+    pub socks5: Option<String>,
+    /// The proxies can be changed on the host only.
+    pub proxy_locked: bool,
+    /// Who may manage the gateway's network over ContextVM.
+    pub admins: Vec<PublicKey>,
     pub nodes: Vec<NodeConfig>,
     pub limits: Limits,
     pub admin_listen: Option<Listen>,
@@ -198,6 +214,8 @@ fn merge(a: &mut Layer, b: Layer) {
         trusted_proxies,
         relays,
         socks5,
+        proxy_locked,
+        admins,
         nodes
     );
     if let Some(bl) = b.limits {
@@ -248,6 +266,11 @@ fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
     let secure_cookie = get("ADMIN_SECURE_COOKIE")
         .map(|v| settings::flag("LNADDR_GATEWAY_ADMIN_SECURE_COOKIE", &v))
         .transpose()?;
+    let flag = |k: &str| -> Result<Option<bool>, String> {
+        get(k)
+            .map(|v| settings::flag(&format!("LNADDR_GATEWAY_{k}"), &v))
+            .transpose()
+    };
     let nodes = get("NODES").or(get("NODE")).map(|v| {
         settings::list(&v)
             .into_iter()
@@ -265,13 +288,19 @@ fn env_layer(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Layer, String> {
         trusted_proxies: get("TRUSTED_PROXIES").map(|v| settings::list(&v)),
         relays: get("RELAYS").map(|v| settings::list(&v)),
         socks5: get("SOCKS5"),
+        proxy_locked: flag("PROXY_LOCKED")?,
+        admins: get("ADMINS").map(|v| settings::list(&v)),
         nodes,
         limits: Some(limits),
         admin: Some(AdminLayer {
             listen: get("ADMIN_LISTEN"),
             secure_cookie,
         }),
-        sources: None,
+        sources: Some(SourcesLayer {
+            file: None,
+            env: None,
+            remote: flag("REMOTE")?,
+        }),
     })
 }
 
@@ -353,7 +382,13 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
         rs.iter().try_for_each(|r| settings::relay(r).map(|_| ()))
     };
     check_relays(&relays)?;
-    let socks5 = l.socks5.as_deref().map(settings::socks5).transpose()?;
+    let socks5 = l.socks5.as_deref().map(settings::proxy_url).transpose()?;
+    let admins = l
+        .admins
+        .unwrap_or_default()
+        .iter()
+        .map(|k| settings::pubkey(k).map_err(|e| format!("admins: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
     let node_layers = l.nodes.unwrap_or_default();
     if node_layers.is_empty() {
         return Err("nodes: set the node's public key (run `lnaddr-node pubkey` next to your Lightning node)".into());
@@ -404,6 +439,8 @@ pub fn load(builtin: Option<&str>, lookup: &dyn Fn(&str) -> Option<String>) -> R
         scheme_override,
         trusted_proxies,
         socks5,
+        proxy_locked: l.proxy_locked.unwrap_or(false),
+        admins,
         nodes,
         limits,
         admin_listen,
@@ -507,7 +544,31 @@ names = ["*"]
         assert_eq!(c.admin_listen.as_ref().unwrap().to_string(), "127.0.0.1:8081");
         assert!(!c.secure_cookie);
         assert_eq!(c.origin("a.example"), "http://a.example");
-        assert!(c.socks5.is_some());
+        // An existing configuration keeps working: its proxy is read as a url,
+        // nobody manages the network remotely, and the proxies are not locked.
+        assert_eq!(c.socks5.as_deref(), Some("socks5://127.0.0.1:9050"));
+        assert!(c.admins.is_empty() && !c.proxy_locked && !c.sources.remote);
+        assert_eq!(c.nodes[0].relays, ["ws://127.0.0.1:7000"]);
+    }
+
+    #[test]
+    fn console_admins_remote_settings_and_the_proxy_lock() {
+        let admin = nostr_sdk::Keys::generate().public_key();
+        let file = format!(
+            "domains = [\"x.io\"]\nadmins = [\"{}\"]\nproxy_locked = true\nsources = {{ remote = true }}\n[[nodes]]\npubkey = \"{}\"\n",
+            admin.to_hex(),
+            node_hex()
+        );
+        let c = load_pairs(Some(&file), &[]).unwrap();
+        assert_eq!(c.admins, [admin]);
+        assert!(c.proxy_locked && c.sources.remote);
+        let mut pairs = minimal();
+        pairs.push(("LNADDR_GATEWAY_ADMINS", nostr_sdk::ToBech32::to_bech32(&admin).unwrap()));
+        pairs.push(("LNADDR_GATEWAY_REMOTE", "on".into()));
+        pairs.push(("LNADDR_GATEWAY_PROXY_LOCKED", "off".into()));
+        let c = load_pairs(None, &pairs).unwrap();
+        assert_eq!(c.admins, [admin]);
+        assert!(!c.proxy_locked && c.sources.remote);
     }
 
     #[test]
@@ -555,6 +616,9 @@ names = ["*"]
                 "must differ from listen",
             ),
             ("LNADDR_GATEWAY_ADMIN_LISTEN", "nope", "not an address"),
+            ("LNADDR_GATEWAY_ADMINS", "nope", "admins: \"nope\""),
+            ("LNADDR_GATEWAY_REMOTE", "maybe", "not on or off"),
+            ("LNADDR_GATEWAY_PROXY_LOCKED", "maybe", "not on or off"),
             ("LNADDR_GATEWAY_CONFIG", "/does/not/exist", "/does/not/exist"),
         ];
         for (k, v, want) in cases {
