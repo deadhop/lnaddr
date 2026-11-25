@@ -129,6 +129,25 @@ pub fn shared_relay_warnings(cfg: &Config, t: &Topology) -> Vec<String> {
     out
 }
 
+/// The nodes (by index) the gateway key could reach on no relay with `t`
+/// even with every proxy up: none shared, or each shared one blocked (by the
+/// default route, a rule, or a Tor or I2P address with nothing to carry it).
+pub fn unroutable_nodes(cfg: &Config, t: &Topology) -> Vec<usize> {
+    let up = |_: &deadhop_netengine::routes::Destination| Some((String::new(), String::new()));
+    let open: Vec<String> = deadhop_netengine::routes::resolve(t, GATEWAY_LANE, &up, Some(true))
+        .into_iter()
+        .filter(|r| r.via != deadhop_netengine::routes::Via::Off)
+        .map(|r| r.relay)
+        .collect();
+    (0..cfg.nodes.len())
+        .filter(|&i| {
+            !open
+                .iter()
+                .any(|r| cfg.nodes[i].relays.iter().any(|x| same_relay(x, r)))
+        })
+        .collect()
+}
+
 /// One relay pool the gateway opened to a node.
 pub struct Conn {
     lane: &'static str,
@@ -188,6 +207,10 @@ pub struct Network {
     restart: tokio::sync::Notify,
     restart_pending: AtomicBool,
     pubkeys: Mutex<BTreeMap<&'static str, String>>,
+    /// Why `network.json` was not used, if it was not.
+    load_error: Mutex<Option<String>>,
+    /// Why the console's server is not running, if it should and is not.
+    server_error: Mutex<Option<String>>,
     now: fn() -> u64,
 }
 
@@ -210,17 +233,19 @@ impl Network {
             restart: tokio::sync::Notify::new(),
             restart_pending: AtomicBool::new(false),
             pubkeys: Mutex::new(BTreeMap::new()),
+            load_error: Mutex::new(None),
+            server_error: Mutex::new(None),
             now: crate::unix_now,
         }
     }
 
     /// The network as the configuration and `network.json` set it, with
     /// the proxies looked at: what a one-off command connects with.
-    pub async fn for_command(cfg: &Config) -> Result<Arc<Network>, String> {
+    pub async fn for_command(cfg: &Config) -> Arc<Network> {
         let net = Arc::new(Network::new(cfg.clone()));
-        net.load_network()?;
+        net.load_network();
         net.runtime.refresh_pool(&*net).await;
-        Ok(net)
+        net
     }
 
     pub fn config(&self) -> &Config {
@@ -259,7 +284,9 @@ impl Network {
     }
 
     /// Open a client to `node` on `lane`'s routes, kept track of so a move
-    /// of routes reaches it.
+    /// of routes reaches it, and checked once open against the routes then:
+    /// a move while it connected (slow over Tor) must not leave it on the
+    /// old ones.
     pub async fn connect_node(
         self: &Arc<Self>,
         lane: &'static str,
@@ -270,6 +297,23 @@ impl Network {
         let routes = self
             .node_routes(lane, node)
             .ok_or("no relay of this node has a route now (kill switch, blocked, or its proxy is down)".to_string())?;
+        let (client, conn) = self.open_node(lane, keys, node, routes, timeout).await?;
+        self.follow(&conn).await;
+        // Moved off its relays while it connected: closed, and the caller tries again.
+        (!conn.stale())
+            .then_some((client, conn))
+            .ok_or("the routes moved while connecting; try again".to_string())
+    }
+
+    /// Open a client to `node` on `routes` and keep track of it.
+    async fn open_node(
+        self: &Arc<Self>,
+        lane: &'static str,
+        keys: Keys,
+        node: &NodeConfig,
+        routes: Routes,
+        timeout: std::time::Duration,
+    ) -> Result<(NodeClient, Arc<Conn>), String> {
         let sink: deadhop_net::relay::RelaySink = {
             let net = self.clone();
             Arc::new(move |relay, ok, ms| net.runtime.record_relay_event(&*net, relay, "send", ok, Some(ms)))
@@ -300,27 +344,32 @@ impl Network {
     /// closed, and its link opens a new one on its next call.
     pub async fn move_conns(&self) {
         for c in self.live_conns() {
-            let want = self.node_routes(c.lane, &c.node);
-            let current = lock(&c.routes).clone();
-            match want {
-                Some(w) if same_relays(&current, &w) => {
-                    if w == current {
-                        continue;
-                    }
-                    let moved = match route_specs(&w) {
-                        Ok(specs) => c.pool.reroute(specs).await.map_err(crate::why),
-                        Err(e) => Err(e.to_string()),
-                    };
-                    match moved {
-                        Ok(()) => *lock(&c.routes) = w,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "could not move a node connection; it is remade");
-                            c.retire().await;
-                        }
+            self.follow(&c).await;
+        }
+    }
+
+    /// Bring one pool to the routes its lane has for its node now.
+    async fn follow(&self, c: &Conn) {
+        let want = self.node_routes(c.lane, &c.node);
+        let current = lock(&c.routes).clone();
+        match want {
+            Some(w) if same_relays(&current, &w) => {
+                if w == current {
+                    return;
+                }
+                let moved = match route_specs(&w) {
+                    Ok(specs) => c.pool.reroute(specs).await.map_err(crate::why),
+                    Err(e) => Err(e.to_string()),
+                };
+                match moved {
+                    Ok(()) => *lock(&c.routes) = w,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not move a node connection; it is remade");
+                        c.retire().await;
                     }
                 }
-                _ => c.retire().await,
             }
+            _ => c.retire().await,
         }
     }
 
@@ -330,6 +379,12 @@ impl Network {
         for c in self.live_conns() {
             c.retire().await;
         }
+    }
+
+    /// Whether the console's server pool is set (tests).
+    #[cfg(test)]
+    pub fn has_server_pool(&self) -> bool {
+        lock(&self.server_pool).is_some()
     }
 
     /// The relay pool of the console's server (`None`: not connected).
@@ -389,9 +444,18 @@ impl Network {
     }
 
     /// Read `network.json` (when remote settings are on) and run on it.
-    /// Saved settings that do not fit stop the gateway with the reason;
-    /// saved relays that leave a node out are only warned about.
-    pub fn load_network(&self) -> Result<(), String> {
+    /// Saved settings that do not fit are not used: the gateway runs on its
+    /// configuration, logs why and says so in `get_network` and `get_health`
+    /// (the LNURL side must keep serving). Saved relays that leave a node
+    /// out are used, and warned about.
+    pub fn load_network(&self) {
+        if let Err(e) = self.try_load_network() {
+            tracing::error!(error = %e, "the saved network settings are not used; running on the configuration");
+            *lock(&self.load_error) = Some(e);
+        }
+    }
+
+    fn try_load_network(&self) -> Result<(), String> {
         if !self.cfg.sources.remote {
             return Ok(());
         }
@@ -416,6 +480,24 @@ impl Network {
         *lock(&self.stored) = stored;
         self.set(next);
         Ok(())
+    }
+
+    /// What is wrong now: nodes a key shares no relay with, saved settings
+    /// that could not be used, a console server that is not running.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = shared_relay_warnings(&self.cfg, &self.topology());
+        if let Some(e) = lock(&self.load_error).clone() {
+            out.push(format!("saved network settings not used: {e}"));
+        }
+        if let Some(e) = lock(&self.server_error).clone() {
+            out.push(format!("the console server is not running: {e}"));
+        }
+        out
+    }
+
+    /// Why the console's server is not running (`None`: it is, or there is none).
+    pub fn set_server_error(&self, e: Option<String>) {
+        *lock(&self.server_error) = e;
     }
 
     /// Save `stored` changed by `f` and run on what it makes of the baseline.
@@ -475,7 +557,7 @@ impl Network {
             keys: self.key_infos(),
             proxy_locked: self.proxies_locked(),
             restart_pending: self.restart_pending(),
-            warnings: shared_relay_warnings(&self.cfg, &self.topology()),
+            warnings: self.warnings(),
         }
     }
 
@@ -555,6 +637,22 @@ impl Network {
                 format!("relay_names: {url:?} is not a listed relay"),
             ));
         }
+        // Nor may any change leave the gateway key a node it could reach
+        // before with no relay it may use (a blocking default route or rule).
+        let cut_before = unroutable_nodes(&self.cfg, &before);
+        if let Some(i) = unroutable_nodes(&self.cfg, &next)
+            .into_iter()
+            .find(|i| !cut_before.contains(i))
+        {
+            return Err(refuse(
+                code::INVALID,
+                format!(
+                    "node {} would have no relay the gateway key may use (blocked by the default route or a rule); its relays: {}",
+                    i + 1,
+                    self.cfg.nodes[i].relays.join(", ")
+                ),
+            ));
+        }
         let proxies_changed = next.proxies != before.proxies;
         if proxies_changed {
             if let Some(key) = self.runtime.stranded(&before, &next) {
@@ -577,7 +675,10 @@ impl Network {
             self.schedule_restart();
         }
         if proxies_changed {
-            self.runtime.begin_probation(self, before.settings.proxies);
+            // Back to the previous proxies (straight, if there were none)
+            // when none of the new ones works.
+            self.runtime
+                .begin_probation_back_to_direct(self, before.settings.proxies);
         }
         self.record(&actor, "update_network", &detail)?;
         Ok(self.view(chain))
@@ -597,7 +698,8 @@ impl Network {
             self.schedule_restart();
         }
         if next.proxies != before.proxies {
-            self.runtime.begin_probation(self, before.proxies.clone());
+            self.runtime
+                .begin_probation_back_to_direct(self, before.proxies.clone());
         }
         self.record(&actor, "reset_network", "")?;
         Ok(self.view(chain))
@@ -633,7 +735,7 @@ impl Network {
             proxy_pool: net.pool_health(self),
             relay_health: lock(&net.relay_health).clone(),
             restart_pending: self.restart_pending(),
-            warnings: shared_relay_warnings(&self.cfg, &self.topology()),
+            warnings: self.warnings(),
             nodes,
         })
     }
@@ -1075,7 +1177,7 @@ mod tests {
         )
         .unwrap();
         let again = Network::new(c.clone());
-        again.load_network().unwrap();
+        again.load_network();
         assert_eq!(again.settings().proxies, again.baseline().proxies);
         // With remote settings off, nothing changes, nothing is read, and the
         // lock is named after that.
@@ -1087,7 +1189,7 @@ mod tests {
             code::LOCKED
         );
         assert_eq!(off.reset_network(&admin(), None).unwrap_err().code, code::LOCKED);
-        off.load_network().unwrap();
+        off.load_network();
         assert!(off.proxies_locked() && off.get_network(&admin(), None).unwrap().proxy_locked);
         assert_eq!(NetworkHost::audit_facts(&off).lock_setting, REMOTE_OFF);
     }
@@ -1116,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn saved_network_settings_are_loaded_and_checked_at_start() {
         let dir = tempfile::tempdir().unwrap();
-        rig(dir.path()).load_network().unwrap();
+        rig(dir.path()).load_network();
         // Saved relays that leave a node out (the configuration changed since)
         // are loaded, and warned about.
         let saved = NetworkFile {
@@ -1125,22 +1227,32 @@ mod tests {
         };
         write_network(dir.path(), &saved).unwrap();
         let net = rig(dir.path());
-        net.load_network().unwrap();
+        net.load_network();
         assert_eq!(net.settings().relays, ["ws://127.0.0.1:1"]);
         let v = net.get_network(&admin(), None).unwrap();
         assert_eq!(v.overridden, ["relays"]);
         assert_eq!(v.warnings.len(), 2, "{:?}", v.warnings);
+        // Saved settings that do not fit are not used: the configuration is,
+        // and the views say why.
         for (bad, want) in [
             (json!({ "relays": [] }), "1 to 8"),
             (json!({ "relay_keys": { "ws://127.0.0.1:1": ["x"] } }), "no key 'x'"),
         ] {
             write_network(dir.path(), &serde_json::from_value(bad).unwrap()).unwrap();
-            let e = rig(dir.path()).load_network().unwrap_err();
-            assert!(e.contains(NETWORK_FILE) && e.contains(want), "{e}");
+            let net = rig(dir.path());
+            net.load_network();
+            assert_eq!(net.settings(), *net.baseline());
+            let w = net.warnings();
+            assert!(
+                w.len() == 1 && w[0].contains(NETWORK_FILE) && w[0].contains(want),
+                "{w:?}"
+            );
         }
         std::fs::write(dir.path().join(NETWORK_FILE), "junk").unwrap();
-        assert!(rig(dir.path()).load_network().is_err());
-        assert!(Network::for_command(&cfg(dir.path())).await.is_err());
+        let net = Network::for_command(&cfg(dir.path())).await;
+        assert!(net.warnings()[0].starts_with("saved network settings not used"));
+        net.set_server_error(Some("boom".into()));
+        assert!(net.warnings()[1].contains("console server is not running: boom"));
     }
 
     #[tokio::test]
@@ -1280,5 +1392,99 @@ mod tests {
         net.drop_conns().await;
         assert!(fresh.stale());
         net.set_server_pool(None);
+    }
+
+    #[tokio::test]
+    async fn a_proxy_change_that_blocks_every_relay_of_a_node_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = rig(dir.path());
+        let bad = |v: serde_json::Value, want: &str| {
+            let r = net.update_network(&admin(), patch(v), None).unwrap_err();
+            assert!(r.message.contains(want), "{want}: {}", r.message);
+        };
+        // A default route that blocks every relay of the gateway key (the
+        // engine's own check), or a rule that blocks each relay of one node.
+        bad(json!({ "proxies": { "default": "block" } }), "could not be reached");
+        // A rule blocking node 2's relays (2 and 3) for the gateway key.
+        bad(
+            json!({ "proxies": { "rules": [{ "match": ["ws://127.0.0.1:2", "ws://127.0.0.1:3"], "keys": ["gateway"], "to": "block" }] } }),
+            "node 2 would have no relay",
+        );
+        assert_eq!(net.settings(), *net.baseline());
+        // Blocking the admin key only, or one relay of a node, is fine.
+        net.update_network(
+            &admin(),
+            patch(json!({ "proxies": { "rules": [
+                { "match": ["ws://127.0.0.1:1"], "keys": ["gateway"], "to": "block" },
+                { "match": ["ws://127.0.0.1:3"], "keys": ["admin"], "to": "block" }
+            ] } })),
+            None,
+        )
+        .unwrap();
+        // A node already cut off (saved before) does not block other changes.
+        let mut cut = net.settings();
+        cut.relays = vec!["ws://127.0.0.1:1".into()];
+        net.set(cut);
+        assert_eq!(unroutable_nodes(net.config(), &net.topology()), [0, 1]);
+        net.update_network(&admin(), patch(json!({ "proxies": { "offline": "open" } })), None)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_first_proxy_that_does_not_work_gives_way_to_straight_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = rig(dir.path());
+        net.runtime.refresh_pool(&net).await;
+        // No proxy before; one on a port nothing listens on, as the default
+        // route: the kill switch would cut both keys off for good.
+        net.update_network(
+            &admin(),
+            patch(json!({ "proxies": { "list": [{ "id": "p", "url": "socks5://127.0.0.1:1" }], "default": { "proxy": "p" } } })),
+            None,
+        )
+        .unwrap();
+        assert!(net.runtime.pool.lock().unwrap().probation.is_some());
+        net.runtime.refresh_pool(&net).await;
+        assert_eq!(net.settings().proxies, net.baseline().proxies, "back to straight");
+        assert_eq!(audit_lines(dir.path()).last().unwrap().action, "revert_proxies");
+        assert!(net.runtime.lane_routes(&net, GATEWAY_LANE).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pool_opened_while_the_routes_moved_follows_them() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let (a, _pa) = deadhop_net::testing::socks5_proxy(None).await;
+        let (b, _pb) = deadhop_net::testing::socks5_proxy(None).await;
+        let (a, b) = (format!("socks5://127.0.0.1:{a}"), format!("socks5://127.0.0.1:{b}"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = gateway_config_for(vec![node(&[&url])], dir.path());
+        c.socks5 = Some(a.clone());
+        let net = Arc::new(Network::new(c));
+        net.runtime.refresh_pool(&*net).await;
+        let n = net.config().nodes[0].clone();
+        let t = Duration::from_secs(5);
+        // Opened on the routes of then; the proxy moved while it connected.
+        let then = net.node_routes(GATEWAY_LANE, &n).unwrap();
+        let (_c1, moved) = net
+            .open_node(GATEWAY_LANE, Keys::generate(), &n, then.clone(), t)
+            .await
+            .unwrap();
+        plan(&net, GATEWAY_LANE, Some(&b));
+        net.follow(&moved).await;
+        assert!(!moved.stale());
+        assert_eq!(moved.routes.lock().unwrap()[0].1, b);
+        // Moved off the route entirely meanwhile: closed, and the caller is told.
+        let (_c2, cut) = net
+            .open_node(GATEWAY_LANE, Keys::generate(), &n, then, t)
+            .await
+            .unwrap();
+        plan(&net, GATEWAY_LANE, None);
+        net.follow(&cut).await;
+        assert!(cut.stale());
+        // connect_node checks once open: unchanged routes keep it.
+        plan(&net, GATEWAY_LANE, Some(&a));
+        let (_c3, kept) = net.connect_node(GATEWAY_LANE, Keys::generate(), &n, t).await.unwrap();
+        assert!(!kept.stale());
     }
 }

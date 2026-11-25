@@ -5,9 +5,12 @@
 //! the previous relays if the console's server connects on none of the new
 //! ones; a move of the proxy pool moves only the relays whose route changed
 //! (`Pool::reroute`); and saved relays with nothing connected for
-//! [`RELAY_DEAD_AFTER`] give way to the configured ones. Unlike the node, a
-//! server that cannot be brought back does not stop the gateway: the LNURL
-//! side keeps serving, and the server is tried again on the next look.
+//! [`RELAY_DEAD_AFTER`] give way to the configured ones. Both lanes are
+//! judged: the console's server must reach a relay (when it runs), and the
+//! gateway key at least one node. Unlike the node, a server that cannot be
+//! started or brought back does not stop the gateway: the LNURL side keeps
+//! serving, `get_health` says why, and the server is tried again on the next
+//! look.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -67,6 +70,7 @@ pub struct Ident {
 
 /// One generation of the console server's relay connections and its request loop.
 pub struct Link {
+    net: Arc<Network>,
     routes: Routes,
     pool: Arc<Pool>,
     cancel: CancellationToken,
@@ -121,6 +125,7 @@ impl Link {
         });
         net.set_server_pool(Some(pool.clone()));
         Ok(Link {
+            net: net.clone(),
             routes,
             pool,
             cancel,
@@ -142,6 +147,7 @@ impl Link {
         self.cancel.cancel();
         let _ = self.task.await;
         self.pool.client().disconnect().await;
+        self.net.set_server_pool(None);
     }
 
     /// Whether any relay is connected right now.
@@ -162,20 +168,23 @@ impl Link {
 
 /// Connect the console's server the way the network is set now: each relay
 /// of the admin lane through its route, or (no server, kill switch, every
-/// relay blocked) not at all.
+/// relay blocked) not at all. Why it is not running is kept for `get_health`.
 pub async fn connect(id: &Option<Ident>, net: &Arc<Network>, dir: &Arc<Directory>) -> Result<Option<Link>, String> {
     let Some(id) = id else { return Ok(None) };
-    match net.runtime.lane_routes(&**net, ADMIN_LANE) {
-        Some(routes) => Ok(Some(Link::up(id, routes, net, dir).await?)),
-        None => {
-            tracing::warn!(
-                "no relay of the admin key has a route now (kill switch, blocked, or its proxy is down): the console cannot reach the gateway"
-            );
-            net.set_server_pool(None);
-            Ok(None)
-        }
-    }
+    let out = match net.runtime.lane_routes(&**net, ADMIN_LANE) {
+        Some(routes) => Link::up(id, routes, net, dir).await.map(Some),
+        None => Ok(None),
+    };
+    net.set_server_error(match &out {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(NO_ROUTE.into()),
+        Err(e) => Some(e.clone()),
+    });
+    out
 }
+
+/// Why the console's server is down when the admin key may not connect.
+pub const NO_ROUTE: &str = "no relay of the admin key has a route now (kill switch, blocked, or its proxy is down)";
 
 type RelaySetup = (Vec<String>, BTreeMap<String, Vec<String>>);
 
@@ -211,9 +220,10 @@ async fn relink(
         return connect(id, net, dir).await;
     }
     // New connections that cannot even start count as connections that do
-    // not connect.
+    // not connect. The console's server must reach a relay, and the gateway
+    // key at least one node.
     if let Ok(mut link) = connect(id, net, dir).await {
-        if !dead(&link, RELAY_CHECK).await {
+        if !dead(&link, RELAY_CHECK).await && dir.any_connects_within(RELAY_CHECK).await {
             return Ok(link);
         }
         close(&mut link).await;
@@ -262,11 +272,12 @@ fn watch_action(connected: bool, silent_for: Duration, on_configured_relays: boo
     }
 }
 
-/// The value, or (after logging why) no connection: the gateway carries on
-/// serving and the next look tries again.
-fn or_log(result: Result<Option<Link>, String>, what: &str) -> Option<Link> {
+/// The value, or (after logging why, and keeping it for `get_health`) no
+/// connection: the gateway carries on serving and the next look tries again.
+pub fn or_log(net: &Network, result: Result<Option<Link>, String>, what: &str) -> Option<Link> {
     result.unwrap_or_else(|e| {
         tracing::error!(error = %e, "{what}");
+        net.set_server_error(Some(format!("{what}: {e}")));
         None
     })
 }
@@ -312,7 +323,7 @@ pub async fn supervise(s: Supervised, mut link: Option<Link>, stop: Cancellation
                 tokio::time::sleep(RESTART_GRACE).await;
                 close(&mut link).await;
                 net.drop_conns().await;
-                link = or_log(relink(&id, &net, &dir, live.clone()).await, "could not remake the relay connections");
+                link = or_log(&net, relink(&id, &net, &dir, live.clone()).await, "could not remake the relay connections");
                 live = relay_setup(&net);
                 net.restarted();
                 last_connected = tokio::time::Instant::now();
@@ -321,7 +332,7 @@ pub async fn supervise(s: Supervised, mut link: Option<Link>, stop: Cancellation
             _ = request_loop_ended => {
                 tracing::warn!("the console's request loop stopped; it is brought back on the next look");
                 close(&mut link).await;
-                net.set_server_pool(None);
+                net.set_server_error(Some("its request loop stopped; it is brought back shortly".into()));
             }
             _ = net.runtime.pool_changed() => {
                 tokio::time::sleep(RESTART_GRACE).await;
@@ -345,26 +356,33 @@ pub async fn supervise(s: Supervised, mut link: Option<Link>, stop: Cancellation
                     }
                     _ => {
                         close(&mut link).await;
-                        link = or_log(connect(&id, &net, &dir).await, "could not move the console's relay connections");
+                        link = or_log(&net, connect(&id, &net, &dir).await, "could not move the console's relay connections");
                     }
                 }
                 last_connected = tokio::time::Instant::now();
                 tracing::info!(console = link.is_some(), "relay connections moved");
             }
             _ = watch.tick() => {
-                let Some(l) = &link else {
-                    // No server: bring it back if it should run and may connect.
-                    if id.is_some() && net.runtime.lane_routes(&*net, ADMIN_LANE).is_some() {
-                        link = or_log(connect(&id, &net, &dir).await, "could not bring the console's server back");
-                        last_connected = tokio::time::Instant::now();
-                    }
+                // No server: bring it back if it should run and may connect.
+                if id.is_some() && link.is_none() && net.runtime.lane_routes(&*net, ADMIN_LANE).is_some() {
+                    link = or_log(&net, connect(&id, &net, &dir).await, "could not bring the console's server back");
+                    last_connected = tokio::time::Instant::now();
                     continue;
+                }
+                // The console's server (if it should run) and the gateway key
+                // must each reach a relay; a server with no route at all
+                // counts as one that reaches none.
+                let console = match (&id, &link) {
+                    (None, _) => true,
+                    (Some(_), Some(l)) => l.connected().await,
+                    (Some(_), None) => false,
                 };
+                let connected = console && dir.any_connected().await;
                 let on_configured = {
                     let s = net.settings();
                     s.relays == net.baseline().relays && s.relay_keys.is_empty()
                 };
-                match watch_action(l.connected().await, last_connected.elapsed(), on_configured) {
+                match watch_action(connected, last_connected.elapsed(), on_configured) {
                     Watch::Fine => last_connected = tokio::time::Instant::now(),
                     Watch::Wait => {}
                     Watch::Retry => {
@@ -375,7 +393,7 @@ pub async fn supervise(s: Supervised, mut link: Option<Link>, stop: Cancellation
                         last_connected = tokio::time::Instant::now();
                         tracing::warn!("no relay has been connected for a while; going back to the configured relays");
                         close(&mut link).await;
-                        link = or_log(fall_back(&id, &net, &dir, DEAD_RELAYS).await, "could not go back to the configured relays");
+                        link = or_log(&net, fall_back(&id, &net, &dir, DEAD_RELAYS).await, "could not go back to the configured relays");
                         live = relay_setup(&net);
                         net.restarted();
                     }
@@ -506,13 +524,9 @@ mod tests {
         tokio::time::sleep(RESTART_GRACE + Duration::from_millis(500)).await;
         // Still answering on the old relay: the move left the new ones alone.
         // Retried, since a loaded machine (the coverage run) can be slow to answer.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !console_answers(&s, &s.node_rig.relay_url).await {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the console still reaches the old relay"
-            );
-        }
+        let answers = async { while !console_answers(&s, &s.node_rig.relay_url).await {} };
+        let answered = tokio::time::timeout(Duration::from_secs(10), answers).await;
+        assert!(answered.is_ok(), "the console still reaches the old relay");
         net.schedule_restart();
         eventually("the revert", Duration::from_secs(15), || {
             net.settings().relays == [s.node_rig.relay_url.clone()]
@@ -526,10 +540,15 @@ mod tests {
         let s = stack().await;
         let net = s.gw().net.clone();
         let second = MockRelay::run().await.unwrap();
-        net.revert_connection(vec![second.url().await.to_string()], BTreeMap::new(), "test")
-            .unwrap();
+        // Saved relays (from before the shared-relay rule): the console on a
+        // second relay alone, the gateway key on the node's.
+        let first = s.node_rig.relay_url.clone();
+        let both = vec![first.clone(), second.url().await.to_string()];
+        let keys = BTreeMap::from([(first, vec![GATEWAY_LANE.to_string()])]);
+        net.revert_connection(both.clone(), keys, "test").unwrap();
         net.schedule_restart();
-        tokio::time::sleep(RESTART_GRACE + Duration::from_secs(1)).await;
+        eventually("the restart", Duration::from_secs(15), || !net.restart_pending()).await;
+        assert_eq!(net.settings().relays, both, "kept: both lanes connect");
         second.shutdown();
         eventually("the fallback", Duration::from_secs(20), || {
             last_audit(&s).1 == DEAD_RELAYS
@@ -560,8 +579,13 @@ mod tests {
         .await;
         assert_eq!(s.gw().net.settings().relays, s.gw().net.baseline().relays);
         assert_eq!(last_audit(&s).1, DEAD_AT_START);
+        // Saved settings that cannot be read do not stop the gateway: it runs
+        // on its configuration and says so.
         std::fs::write(s.cfg.data_dir.join(NETWORK_FILE), "junk").unwrap();
-        assert!(crate::gateway::app::start(s.cfg.clone()).await.is_err());
+        let again = crate::gateway::app::start(s.cfg.clone()).await.unwrap();
+        assert!(again.net.warnings()[0].contains(NETWORK_FILE));
+        assert_eq!(again.net.settings(), *again.net.baseline());
+        again.until(Box::pin(async {})).await;
         s.stop().await;
     }
 
@@ -597,6 +621,10 @@ mod tests {
         tokio::time::sleep(RESTART_GRACE + Duration::from_secs(1)).await;
         let states = deadhop_netengine::netruntime::NetworkHost::relay_states(&*net).await;
         assert!(states.iter().all(|r| !r.connected), "{states:?}");
+        // The closed server's pool is not reported, and health says why.
+        assert!(!net.has_server_pool());
+        let w = net.warnings();
+        assert!(w.iter().any(|w| w.contains(NO_ROUTE)), "{w:?}");
         assert!(
             s.gw().dir.nodes[0].refresh().await.is_err(),
             "no invoice request leaves"
@@ -651,6 +679,41 @@ mod tests {
         net.schedule_restart();
         eventually("the restart", Duration::from_secs(10), || !net.restart_pending()).await;
         tokio::time::sleep(RELAY_WATCH_EVERY * 2).await;
+        assert!(s.gw().dir.nodes[0].refresh().await.is_ok());
+        s.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_relays_the_admin_key_has_no_route_on_give_way_to_the_configured_ones() {
+        let s = stack().await;
+        let net = s.gw().net.clone();
+        let first = s.node_rig.relay_url.clone();
+        // Saved: the only relay is the gateway key's; the console has none.
+        let keys = BTreeMap::from([(first.clone(), vec![GATEWAY_LANE.to_string()])]);
+        net.revert_connection(vec![first], keys, "test").unwrap();
+        net.schedule_restart();
+        eventually("the fallback", Duration::from_secs(20), || {
+            last_audit(&s).1 == DEAD_RELAYS
+        })
+        .await;
+        assert!(net.settings().relay_keys.is_empty());
+        eventually("the console", Duration::from_secs(10), || net.has_server_pool()).await;
+        s.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_relay_change_that_leaves_the_gateway_key_no_node_is_undone() {
+        let s = stack_with(Kind::Lnd, |c| c.nodes[0].relays.push("ws://127.0.0.1:9".into())).await;
+        let net = s.gw().net.clone();
+        let first = s.node_rig.relay_url.clone();
+        // The live relay for the admin key only: the gateway key keeps the
+        // node's dead one, which the rules allow but nothing answers on.
+        update(&net, json!({ "relay_keys": { first.clone(): ["admin"] } }));
+        eventually("the revert", Duration::from_secs(20), || {
+            last_audit(&s).1 == "no relay connected with the new relays"
+        })
+        .await;
+        assert!(net.settings().relay_keys.is_empty());
         assert!(s.gw().dir.nodes[0].refresh().await.is_ok());
         s.stop().await;
     }

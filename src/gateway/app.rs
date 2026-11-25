@@ -17,7 +17,7 @@ use crate::gateway::http::{self, Public};
 use crate::gateway::network::{Network, ADMIN_LANE, GATEWAY_LANE};
 use crate::gateway::nodes::{Directory, NodeLink};
 use crate::gateway::server;
-use crate::gateway::supervise::{close, connect, dead, fall_back, relay_setup, supervise, Ident, Supervised};
+use crate::gateway::supervise::{close, connect, dead, fall_back, or_log, relay_setup, supervise, Ident, Supervised};
 use crate::gateway::supervise::{DEAD_AT_START, RELAY_CHECK, RELAY_HEALTH_EVERY};
 use crate::proto::{self, ConfigView, Status};
 
@@ -73,7 +73,7 @@ pub async fn start(cfg: Config) -> Result<Gateway, String> {
         Some(crate::files::load_or_create_keys(&cfg.data_dir.join(ADMIN_KEY_FILE))?)
     };
     let net = Arc::new(Network::new(cfg.clone()));
-    net.load_network()?;
+    net.load_network();
     net.set_pubkey(GATEWAY_LANE, &keys.public_key().to_hex());
     if let Some(k) = &admin_key {
         net.set_pubkey(ADMIN_LANE, &k.public_key().to_hex());
@@ -102,13 +102,24 @@ pub async fn start(cfg: Config) -> Result<Gateway, String> {
         allowed: cfg.admins.iter().map(|k| k.to_hex()).collect(),
     });
     let saved = relay_setup(&net) != (net.baseline().relays.clone(), BTreeMap::new());
-    let mut link = connect(&id, &net, &dir).await?;
-    // Saved relays the console cannot reach the gateway on would leave its
-    // network unmanageable, and a restart would not help: back to the configured ones.
-    if saved && dead(&link, RELAY_CHECK).await {
+    // A console server that cannot start leaves the LNURL side serving; the
+    // supervisor tries it again.
+    let mut link = or_log(
+        &net,
+        connect(&id, &net, &dir).await,
+        "could not start the console server",
+    );
+    // Saved relays the console or the gateway key reaches nothing on would
+    // leave it unmanageable or without invoices, and a restart would not
+    // help: back to the configured ones.
+    if saved && (dead(&link, RELAY_CHECK).await || !dir.any_connects_within(RELAY_CHECK).await) {
         tracing::warn!("no saved relay connected; using the configured relays");
         close(&mut link).await;
-        link = fall_back(&id, &net, &dir, DEAD_AT_START).await?;
+        link = or_log(
+            &net,
+            fall_back(&id, &net, &dir, DEAD_AT_START).await,
+            "could not go back to the configured relays",
+        );
     }
     // Keep the cache warm: refresh now, then every cache period.
     tasks.push(tokio::spawn({
@@ -261,7 +272,7 @@ async fn admin_link(cfg: &Config, i: usize) -> Result<NodeLink, String> {
         cfg.nodes[i].clone(),
         keys,
         ADMIN_LANE,
-        Network::for_command(cfg).await?,
+        Network::for_command(cfg).await,
         cfg.limits.timeout,
     ))
 }
@@ -366,7 +377,7 @@ async fn status_command(cfg: &Config, out: &mut dyn Write) -> Result<(), String>
     let dir = Directory::new(
         cfg.nodes.clone(),
         own_keys(cfg)?,
-        Network::for_command(cfg).await?,
+        Network::for_command(cfg).await,
         cfg.limits.timeout,
     );
     let started = Instant::now();
@@ -432,7 +443,7 @@ async fn test_command(cfg: &Config, args: &[String], out: &mut dyn Write) -> Res
     let dir = Directory::new(
         cfg.nodes.clone(),
         own_keys(cfg)?,
-        Network::for_command(cfg).await?,
+        Network::for_command(cfg).await,
         cfg.limits.timeout,
     );
     let started = Instant::now();

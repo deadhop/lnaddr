@@ -224,6 +224,25 @@ impl NodeLink {
         h
     }
 
+    /// Whether a relay to the node is connected now (making the client if
+    /// there is none).
+    pub async fn connected(&self) -> bool {
+        match self.client().await {
+            Ok(c) => c.relays_connected().await > 0,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether a relay to the node connects within `limit`.
+    pub async fn connects_within(&self, limit: Duration) -> bool {
+        let wait = async {
+            while !self.connected().await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(limit, wait).await.is_ok()
+    }
+
     pub fn addresses(&self) -> Vec<AddressInfo> {
         read(&self.cache)
             .as_ref()
@@ -338,6 +357,18 @@ impl Directory {
         let min = all.iter().map(|a| a.min_sendable.div_ceil(1000)).min();
         let max = all.iter().map(|a| a.max_sendable / 1000).max();
         (min.unwrap_or(0), max.unwrap_or(0))
+    }
+
+    /// Whether some node has a relay connected on the gateway key now.
+    pub async fn any_connected(&self) -> bool {
+        let all = futures_util::future::join_all(self.nodes.iter().map(NodeLink::connected)).await;
+        all.into_iter().any(|c| c)
+    }
+
+    /// Whether some node has a relay connected on the gateway key within `limit`.
+    pub async fn any_connects_within(&self, limit: Duration) -> bool {
+        let all = futures_util::future::join_all(self.nodes.iter().map(|n| n.connects_within(limit))).await;
+        all.into_iter().any(|c| c)
     }
 
     /// How every node answered lately.
@@ -538,6 +569,17 @@ mod tests {
         let link = NodeLink::new(cfg, Keys::generate(), GATEWAY_LANE, net, Duration::from_secs(1));
         let h = link.health().await;
         assert_eq!((h.relays_connected, h.reachable, h.addresses), (0, false, 0));
+        // Behind a proxy not yet looked at, the node has no route: not connected.
+        let mut cut = crate::gateway::tests::gateway_config_for(vec![link.cfg.clone()], dir.path());
+        cut.socks5 = Some("socks5://127.0.0.1:1".into());
+        let blocked = NodeLink::new(
+            link.cfg.clone(),
+            Keys::generate(),
+            GATEWAY_LANE,
+            Arc::new(Net::new(cut)),
+            Duration::from_secs(1),
+        );
+        assert!(!blocked.connected().await);
         assert!(link.addresses().is_empty());
         link.close().await;
     }
