@@ -64,7 +64,7 @@ panic = "abort"
 strip = true
 
 # rmcp 1.8.0 with the response-task reaping fix backported from rmcp 3.x
-# (deadhop/payments#46), from deadhop/server's vendor/rmcp. [patch] does not
+# (deadhop/server SECURITY.md, finding #46), from deadhop/server's vendor/rmcp. [patch] does not
 # pass down from a dependency, so every crate that links rmcp repeats it. Drop when contextvm-sdk moves to rmcp 3.x.
 [patch.crates-io]
 rmcp = { git = "https://github.com/deadhop/server", branch = "main" }
