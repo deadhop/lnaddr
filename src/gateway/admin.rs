@@ -37,17 +37,17 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const MAX_SESSIONS: usize = 32;
 
 const CSS: &str = include_str!("../../assets/admin.css");
-const MARK: &str = include_str!("../../../brand/logo/mark-currentcolor.svg");
-const FAVICON: &str = include_str!("../../../brand/icons/favicon.svg");
+const MARK: &str = include_str!("../../assets/brand/logo/mark-currentcolor.svg");
+const FAVICON: &str = include_str!("../../assets/brand/icons/favicon.svg");
 const FONTS: [(&str, &[u8]); 3] = [
-    ("geist.woff2", include_bytes!("../../../brand/fonts/geist.woff2")),
+    ("geist.woff2", include_bytes!("../../assets/brand/fonts/geist.woff2")),
     (
         "martian-mono.woff2",
-        include_bytes!("../../../brand/fonts/martian-mono.woff2"),
+        include_bytes!("../../assets/brand/fonts/martian-mono.woff2"),
     ),
     (
         "schibsted-grotesk.woff2",
-        include_bytes!("../../../brand/fonts/schibsted-grotesk.woff2"),
+        include_bytes!("../../assets/brand/fonts/schibsted-grotesk.woff2"),
     ),
 ];
 

@@ -1,22 +1,16 @@
 # deadhop lnaddr: two images from one build, each a single static binary on
-# an empty base. Build context: the repository root (the admin interface
-# embeds the brand's fonts and mark).
+# an empty base. Build context: this repository's root. Cargo fetches the
+# shared crates from deadhop/server at the commit Cargo.lock pins.
 #
-#   docker build -f lnaddr/Dockerfile --target node    -t deadhop-lnaddr-node .
-#   docker build -f lnaddr/Dockerfile --target gateway -t deadhop-lnaddr-gateway .
+#   docker build --target node    -t deadhop-lnaddr-node .
+#   docker build --target gateway -t deadhop-lnaddr-gateway .
 FROM rust:1.99-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY brand/logo/mark-currentcolor.svg brand/logo/
-COPY brand/icons/favicon.svg brand/icons/
-COPY brand/fonts/*.woff2 brand/fonts/
-COPY server/crates server/crates
-COPY server/vendor server/vendor
-COPY lnaddr/Cargo.toml lnaddr/Cargo.lock lnaddr/
-COPY lnaddr/src lnaddr/src
-COPY lnaddr/assets lnaddr/assets
-RUN cd lnaddr \
- && cargo build --release --locked --bins \
+COPY Cargo.toml Cargo.lock ./
+COPY src src
+COPY assets assets
+RUN cargo build --release --locked --bins \
  && install -d -o 10001 -g 10001 -m 0700 /out/data \
  && cp target/release/lnaddr-node target/release/lnaddr-gateway /out/
 

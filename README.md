@@ -9,14 +9,14 @@ A Lightning address (LUD-16) for a node with no public address. Two static binar
 wallet ──https──▶ reverse proxy ──▶ lnaddr-gateway ──Nostr relays──▶ lnaddr-node ──▶ your Lightning backend
 ```
 
-Documentation: `site/docs/lnaddr/` (published at `/docs/lnaddr/`): architecture, performance, hardening, security, configuration, reverse proxies, backends, admin.
+Documentation: [deadhop.run/docs/lnaddr](https://deadhop.run/docs/lnaddr/) (source in [deadhop/site](https://github.com/deadhop/site) under `docs/lnaddr/`): architecture, performance, hardening, security, configuration, reverse proxies, backends, admin.
 
 ## Build
 
 ```sh
 cargo build --release                       # target/release/lnaddr-node, lnaddr-gateway
-docker build -f lnaddr/Dockerfile --target node    -t deadhop-lnaddr-node .     # from the repo root
-docker build -f lnaddr/Dockerfile --target gateway -t deadhop-lnaddr-gateway .
+docker build --target node    -t deadhop-lnaddr-node .
+docker build --target gateway -t deadhop-lnaddr-gateway .
 ```
 
 Both images are a single static (musl) binary on `scratch`, about 8 MB each. No openssl or system TLS: rustls with ring and compiled-in web roots.
@@ -37,7 +37,7 @@ LNADDR_NODE_ADDRESSES=you lnaddr-node
 
 Configuration comes from built-in values (`LNADDR_NODE_BUILTIN` / `LNADDR_GATEWAY_BUILTIN` at build time), a TOML file (`--config`), environment variables, and (node, opt-in) address, limit, relay and proxy changes from an admin key over ContextVM. Any layer can lock later ones out.
 
-The node's relay connections run on deadhop's network engine (`server/crates/netengine`): routing rules, proxy groups, relay health and the privacy audit, managed from the standalone network console (`console/`) with an admin key. So do the gateway's, a lane per key, with a console server on its admin key for the keys in its `admins`.
+The node's relay connections run on deadhop's network engine (`crates/netengine` in [deadhop/server](https://github.com/deadhop/server)): routing rules, proxy groups, relay health and the privacy audit, managed from the standalone network console (`console/` in [deadhop/js](https://github.com/deadhop/js)) with an admin key. So do the gateway's, a lane per key, with a console server on its admin key for the keys in its `admins`.
 
 ## Try it without a Lightning node
 
@@ -50,9 +50,13 @@ The node's relay connections run on deadhop's network engine (`server/crates/net
 ## Verify
 
 ```sh
-cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo llvm-cov --all-targets --fail-under-lines 100 --fail-under-functions 100
+just check                  # fmt, clippy -D warnings, tests with 100% line and function coverage
+just update-server-crates   # move the shared crates to the newest deadhop/server main
 ```
+
+The shared crates (`deadhop-tlspin`, `-cvm`, `-net`, `-common`, `-netengine`) and the patched
+`rmcp` come from [deadhop/server](https://github.com/deadhop/server) through git, pinned by
+`Cargo.lock`.
 
 ## Layout
 
@@ -63,3 +67,8 @@ cargo llvm-cov --all-targets --fail-under-lines 100 --fail-under-functions 100
 | `src/lnurl.rs`, `src/bolt11.rs` | LUD-06/12/16 and invoice checks shared by both |
 | `src/pool.rs`, `src/cvm.rs`, `src/handshake.rs` | relay pool (first OK wins), stateless ContextVM client, local MCP handshake |
 | `src/files.rs`, `src/tls.rs`, `src/settings.rs`, `src/ratelimit.rs` | private files, pinned TLS, config parsing, rate limits |
+| `assets/brand/` | copies of the brand's fonts, mark and favicon (originals in [deadhop/brand](https://github.com/deadhop/brand)) |
+
+## License
+
+[MIT](LICENSE).

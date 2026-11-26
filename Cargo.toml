@@ -16,12 +16,13 @@ name = "lnaddr-gateway"
 path = "src/bin/lnaddr-gateway.rs"
 
 [dependencies]
-# Shared with the payment service (path dependencies; the image builds from the repo root).
-deadhop-tlspin = { path = "../server/crates/tlspin" }
-deadhop-cvm = { path = "../server/crates/cvm" }
-deadhop-net = { path = "../server/crates/net" }
-deadhop-common = { path = "../server/crates/common" }
-deadhop-netengine = { path = "../server/crates/netengine" }
+# Shared with the payment service, from deadhop/server. Cargo.lock pins the
+# commit; `just update-server-crates` moves to the newest one on main.
+deadhop-tlspin = { git = "https://github.com/deadhop/server", branch = "main" }
+deadhop-cvm = { git = "https://github.com/deadhop/server", branch = "main" }
+deadhop-net = { git = "https://github.com/deadhop/server", branch = "main" }
+deadhop-common = { git = "https://github.com/deadhop/server", branch = "main" }
+deadhop-netengine = { git = "https://github.com/deadhop/server", branch = "main" }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
 base64 = "0.22"
@@ -47,9 +48,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 webpki-roots = "1"
 
 [dev-dependencies]
-deadhop-cvm = { path = "../server/crates/cvm", features = ["test-support"] }
-deadhop-net = { path = "../server/crates/net", features = ["test-support"] }
-deadhop-netengine = { path = "../server/crates/netengine", features = ["test-support"] }
+deadhop-cvm = { git = "https://github.com/deadhop/server", branch = "main", features = ["test-support"] }
+deadhop-net = { git = "https://github.com/deadhop/server", branch = "main", features = ["test-support"] }
+deadhop-netengine = { git = "https://github.com/deadhop/server", branch = "main", features = ["test-support"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 nostr-relay-builder = "0.44"
@@ -63,6 +64,7 @@ panic = "abort"
 strip = true
 
 # rmcp 1.8.0 with the response-task reaping fix backported from rmcp 3.x
-# (#46). Drop when contextvm-sdk moves to rmcp 3.x.
+# (deadhop/payments#46), from deadhop/server's vendor/rmcp. [patch] does not
+# pass down from a dependency, so every crate that links rmcp repeats it. Drop when contextvm-sdk moves to rmcp 3.x.
 [patch.crates-io]
-rmcp = { path = "../server/vendor/rmcp" }
+rmcp = { git = "https://github.com/deadhop/server", branch = "main" }
