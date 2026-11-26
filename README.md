@@ -177,6 +177,23 @@ The shared crates (`deadhop-tlspin`, `-cvm`, `-net`, `-common`, `-netengine`) an
 | `demo/` | The local stage: a relay and a fake LND |
 | `assets/brand/` | Copies of the brand's fonts, mark and favicon (originals in [deadhop/brand](https://github.com/deadhop/brand)) |
 
+## Agent skills
+
+This repository ships [agent skills](https://deadhop.run/docs/skills.html) for Claude Code,
+Codex, Cursor and other agents that read `SKILL.md`:
+
+```sh
+npx skills add deadhop/lnaddr
+```
+
+| Skill | Use it to |
+| --- | --- |
+| `deadhop-lnaddr-setup` | set up a Lightning address: `lnaddr-node` next to LND, Core Lightning, phoenixd or LNbits, `lnaddr-gateway` behind a reverse proxy, and check it end to end |
+| `deadhop-lnaddr-develop` | change lnaddr: `just check` at 100% coverage, the shared crates from deadhop/server, the brand copies, the demo stage |
+
+Install one with `--skill <name>`. Every deadhop skill is listed on
+[Agent skills](https://deadhop.run/docs/skills.html).
+
 ## Contributing
 
 Issues and pull requests are welcome here. CI runs `just check` on every pull request; run it
