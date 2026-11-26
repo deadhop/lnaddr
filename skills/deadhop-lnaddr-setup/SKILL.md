@@ -203,9 +203,10 @@ form for a real node.
 
 The gateway serves wallets without it. To turn it on, set `LNADDR_GATEWAY_ADMIN_LISTEN` to a
 loopback address such as `127.0.0.1:8081` and sign in with the token from
-`lnaddr-gateway admin-token`; reach it with `ssh -L 8081:127.0.0.1:8081 host`. In a container,
-listen on `0.0.0.0:8081` and publish only to the host's loopback (`-p 127.0.0.1:8081:8081`);
-the session cookie is then `Secure` unless `LNADDR_GATEWAY_ADMIN_SECURE_COOKIE` says otherwise.
+`lnaddr-gateway admin-token`; reach it with `ssh -L 8081:127.0.0.1:8081 host`. Off loopback
+(for example inside a container) the session cookie is `Secure` by default, so the interface
+then needs HTTPS in front; the listener and `secure_cookie` settings are in gateway.md. Never
+publish it on a public address.
 
 To change the node's addresses and limits from the gateway (`lnaddr-gateway node set-address …`,
 or the web forms), the node must list the gateway's admin key and allow remote settings:
