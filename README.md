@@ -30,6 +30,10 @@ in. lnaddr splits the job in two:
   checks every invoice before a wallet sees it: amount, description hash, network, expiry and,
   optionally, your node's pinned key.
 
+The node keeps a record of the invoices it made, with each payer's LUD-12 comment. A wallet can
+ask the gateway whether its invoice was paid (LUD-21 `verify`), and your own tools can list the
+payments over ContextVM with the node's admin key (`list_invoices`, `lookup_invoice`).
+
 ```mermaid
 flowchart LR
     W["Payer's wallet"] -- "https: /.well-known/lnurlp/you" --> P["Reverse proxy"]
@@ -59,8 +63,17 @@ $ curl -s http://127.0.0.1:8090/.well-known/lnurlp/alice | jq
 
 $ curl -s "http://127.0.0.1:8090/.well-known/lnurlp/alice/callback?amount=21000" | jq
 {
-  "pr": "lnbcrt210n1p4s277xhp5yeppkn3y0cj78prp8z04qv3sdus5ff2wwt04pswv8xd4kn4xz5dqpp5…",
-  "routes": []
+  "pr": "lnbcrt210n1p4s4j22hp5yeppkn3y0cj78prp8z04qv3sdus5ff2wwt04pswv8xd4kn4xz5dqpp5…",
+  "routes": [],
+  "verify": "http://lnaddr.example/.well-known/lnurlp/alice/verify/e25b31b578eb3770bdd3fa82c800b9effea249ff0a1dd92f21ffd47b0becc51e"
+}
+
+$ curl -s http://127.0.0.1:8090/.well-known/lnurlp/alice/verify/e25b31b578eb3770bdd3fa82c800b9effea249ff0a1dd92f21ffd47b0becc51e | jq
+{
+  "status": "OK",
+  "settled": true,
+  "preimage": "386192ea88f8261fdd29f98413c45568cefaadd026aec98c4f7831c9907703ce",
+  "pr": "lnbcrt210n1p4s4j22hp5yeppkn3y0cj78prp8z04qv3sdus5ff2wwt04pswv8xd4kn4xz5dqpp5…"
 }
 
 $ curl -s "http://127.0.0.1:8090/.well-known/lnurlp/alice/callback?amount=1" | jq
@@ -127,7 +140,9 @@ same: nodes, addresses, invoice counts and timings, and recent failures.
 ## Try it without a Lightning node
 
 `demo/` is a local stage: a Nostr relay on `ws://127.0.0.1:7788`, and a fake LND on
-`http://127.0.0.1:18080` (macaroon `demo`) that signs real regtest invoices.
+`http://127.0.0.1:18080` (macaroon `demo`) that signs real regtest invoices. Nothing can pay
+them, so `curl -X POST http://127.0.0.1:18080/demo/pay/<payment hash>` marks one paid, and its
+`verify` URL then answers `"settled": true`.
 
 ```sh
 (cd demo && cargo run --release)
@@ -169,12 +184,12 @@ The shared crates (`deadhop-tlspin`, `-cvm`, `-net`, `-common`, `-netengine`) an
 
 | Path | What |
 | --- | --- |
-| `src/node/` | The node: config layers, backends, the MCP tools, its network (relays and proxies on the network engine), the request loop, the CLI |
+| `src/node/` | The node: config layers, backends, the MCP tools, the invoice record (`invoices.rs`), its network (relays and proxies on the network engine), the request loop, the CLI |
 | `src/gateway/` | The gateway: config, node directory and cache, public HTTP, admin web, its network, the console's ContextVM server, the CLI |
-| `src/lnurl.rs`, `src/bolt11.rs` | LUD-06/12/16, and the invoice checks both sides share |
+| `src/lnurl.rs`, `src/bolt11.rs` | LUD-06/12/16/21, and the invoice checks both sides share |
 | `src/pool.rs`, `src/cvm.rs`, `src/handshake.rs` | The relay pool (first OK wins), a stateless ContextVM client, the local MCP handshake |
 | `src/files.rs`, `src/tls.rs`, `src/settings.rs`, `src/ratelimit.rs` | Private files, pinned TLS, config parsing, rate limits |
-| `demo/` | The local stage: a relay and a fake LND |
+| `demo/` | The local stage: a relay and a fake LND whose invoices can be marked paid |
 | `assets/brand/` | Copies of the brand's fonts, mark and favicon (originals in [deadhop/brand](https://github.com/deadhop/brand)) |
 
 ## Agent skills

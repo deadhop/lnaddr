@@ -63,6 +63,14 @@ pub struct Expect<'a> {
 pub struct Checked {
     pub payment_hash: String,
     pub payee: String,
+    /// When it stops being payable, in seconds since the Unix epoch.
+    pub expires_at: u64,
+}
+
+/// The payment hash (hex) of a BOLT11 invoice, if it is one.
+pub fn payment_hash(pr: &str) -> Option<String> {
+    let inv = Bolt11Invoice::from_str(pr.trim()).ok().filter(|_| pr.len() <= 4096)?;
+    Some(hex::encode(inv.payment_hash().to_byte_array()))
 }
 
 /// Parse a BOLT11 invoice and check it against `want`. The signature is
@@ -100,6 +108,7 @@ pub fn check(pr: &str, want: &Expect) -> Result<Checked, String> {
     Ok(Checked {
         payment_hash: hex::encode(inv.payment_hash().to_byte_array()),
         payee,
+        expires_at: inv.expires_at().map_or(u64::MAX, |t| t.as_secs()),
     })
 }
 
@@ -156,6 +165,23 @@ pub mod testutil {
             crate::unix_now(),
             3600,
         )
+    }
+
+    /// The same, paid to `sha256(preimage)`.
+    pub fn invoice_paying(amount_msat: u64, hash: [u8; 32], preimage: [u8; 32]) -> String {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&NODE_SECRET).unwrap();
+        InvoiceBuilder::new(Currency::Regtest)
+            .description_hash(sha256::Hash::from_byte_array(hash))
+            .payment_hash(sha256::Hash::hash(&preimage))
+            .payment_secret(PaymentSecret([7; 32]))
+            .duration_since_epoch(Duration::from_secs(crate::unix_now()))
+            .expiry_time(Duration::from_secs(3600))
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(amount_msat)
+            .build_signed(|m| secp.sign_ecdsa_recoverable(m, &sk))
+            .unwrap()
+            .to_string()
     }
 
     /// The same with a plain description instead of a hash.

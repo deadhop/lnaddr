@@ -14,13 +14,25 @@ use crate::bolt11::{self, Expect, Network};
 use crate::lnurl;
 use crate::node::backend::{Backend, Request};
 use crate::node::config::{self, Address, Config, Limits, Remote};
+use crate::node::invoices::{Ledger, Record};
 use crate::node::network::NodeNet;
-use crate::proto::{self, code, AddressInfo, AddressList, ConfigView, MadeInvoice, MakeInvoiceParams, Status};
+use crate::proto::{
+    self, code, AddressInfo, AddressList, ConfigView, InvoiceList, InvoiceView, ListInvoicesParams,
+    LookupInvoiceParams, MadeInvoice, MakeInvoiceParams, Status, Verified, VerifyInvoiceParams,
+};
 use crate::ratelimit::RateLimiter;
 use deadhop_netengine::proxypool::Posture;
 
 /// How far a request's timestamp may be from the node's clock.
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+/// The backend is asked about one invoice at most this often: a payer's
+/// wallet polling LUD-21 must not turn into a stream of backend calls.
+pub const CHECK_GAP_SECS: u64 = 2;
+/// Backend lookups at once while listing.
+const LOOKUPS_AT_ONCE: usize = 8;
+/// Invoices per page of `list_invoices`.
+const DEFAULT_PAGE: u32 = 100;
+const MAX_PAGE: u32 = 1000;
 
 /// A refusal with a stable code and a message safe to send to the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +92,18 @@ pub struct Service {
     failed: AtomicU64,
     last_error: Mutex<Option<String>>,
     payee: Mutex<Option<String>>,
+    /// The invoices made here, and when the backend was last asked about each.
+    ledger: Mutex<Ledger>,
+    checked: Mutex<std::collections::HashMap<String, u64>>,
     started: Instant,
     now: fn() -> u64,
+}
+
+/// `<seconds>:<payment hash>`, as `list_invoices` gives it.
+fn parse_cursor(c: &str) -> Option<(u64, String)> {
+    let (t, h) = c.split_once(':')?;
+    proto::valid_payment_hash(h).then_some(())?;
+    Some((t.parse().ok()?, h.to_string()))
 }
 
 pub(crate) fn network_name(n: Network) -> &'static str {
@@ -122,6 +144,8 @@ impl Service {
             }),
             permits: Semaphore::new(cfg.limits.concurrent as usize),
             backend,
+            ledger: Mutex::new(Ledger::open(&cfg.data_dir, now())),
+            checked: Mutex::new(std::collections::HashMap::new()),
             cfg,
             made: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -213,6 +237,7 @@ impl Service {
             addresses,
             payee: lock(&self.payee).clone(),
             network: network_name(self.cfg.network).into(),
+            verifies: true,
         })
     }
 
@@ -292,9 +317,192 @@ impl Service {
         *lock(&self.payee) = Some(checked.payee);
         self.made.fetch_add(1, Ordering::Relaxed);
         tracing::info!(name = %p.name, msat = p.amount_msat, comment = ?comment, "invoice made");
+        let now = (self.now)();
+        let record = Record {
+            payment_hash: checked.payment_hash.clone(),
+            name: p.name,
+            domain: p.domain,
+            amount_msat: p.amount_msat,
+            comment: (!comment.is_empty()).then(|| comment.to_string()),
+            pr: pr.clone(),
+            created_at: now,
+            expires_at: checked.expires_at,
+            settled_at: None,
+            preimage: None,
+        };
+        if let Err(e) = lock(&self.ledger).add(record, now) {
+            tracing::warn!(error = %e, "the invoice was made but not recorded");
+        }
         Ok(MadeInvoice {
             pr,
             payment_hash: checked.payment_hash,
+        })
+    }
+
+    /// The invoice made here with this hash, after asking the backend
+    /// whether it was paid (unless it was, or it is long expired, or the
+    /// backend was asked a moment ago).
+    async fn refreshed(&self, payment_hash: &str) -> Result<Record, Refusal> {
+        if !proto::valid_payment_hash(payment_hash) {
+            return Err(refuse(code::INVALID, "payment_hash must be 64 lower-case hex digits"));
+        }
+        let now = (self.now)();
+        let r = lock(&self.ledger)
+            .get(payment_hash)
+            .cloned()
+            .ok_or_else(|| refuse(code::NOT_FOUND, "no invoice with that payment hash was made here"))?;
+        if !r.open(now) || !self.due(payment_hash, now) {
+            return Ok(r);
+        }
+        let paid = match self.backend.lookup_invoice(payment_hash).await {
+            Ok(Some(paid)) => paid,
+            Ok(None) => return Ok(r),
+            Err(e) => return Err(self.lookup_failure(e)),
+        };
+        let matches = hex::decode(&paid.preimage).is_ok_and(|p| hex::encode(lnurl::sha256(&p)) == payment_hash);
+        if !matches {
+            return Err(self.lookup_failure("the backend's preimage does not match the payment hash".into()));
+        }
+        let at = paid.at.unwrap_or(now);
+        if let Err(e) = lock(&self.ledger).settle(payment_hash, at, &paid.preimage) {
+            tracing::warn!(error = %e, "the payment was seen but not recorded");
+        }
+        tracing::info!(name = %r.name, msat = r.amount_msat, "invoice paid");
+        Ok(Record {
+            settled_at: Some(at),
+            preimage: Some(paid.preimage),
+            ..r
+        })
+    }
+
+    /// Whether the backend may be asked about this invoice now; if so, the
+    /// time is taken, so callers at the same moment ask only once.
+    fn due(&self, payment_hash: &str, now: u64) -> bool {
+        let mut checked = lock(&self.checked);
+        if checked.get(payment_hash).is_some_and(|t| now < t + CHECK_GAP_SECS) {
+            return false;
+        }
+        checked.retain(|_, t| now < *t + 60);
+        checked.insert(payment_hash.to_string(), now);
+        true
+    }
+
+    fn lookup_failure(&self, detail: String) -> Refusal {
+        tracing::warn!(error = %detail, "invoice lookup failed");
+        *lock(&self.last_error) = Some(detail);
+        refuse(
+            code::BACKEND,
+            "the Lightning node did not say whether the invoice was paid",
+        )
+    }
+
+    fn invoice_view(r: &Record, now: u64) -> InvoiceView {
+        InvoiceView {
+            payment_hash: r.payment_hash.clone(),
+            name: r.name.clone(),
+            domain: r.domain.clone(),
+            amount_msat: r.amount_msat,
+            comment: r.comment.clone(),
+            pr: r.pr.clone(),
+            state: r.state(now).into(),
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+            settled_at: r.settled_at,
+            preimage: r.preimage.clone(),
+        }
+    }
+
+    /// Admins only: the invoices made here, oldest first, a page at a time.
+    /// Invoices that may still be paid are checked with the backend first.
+    pub async fn list_invoices(&self, c: &Caller, p: ListInvoicesParams) -> Result<InvoiceList, Refusal> {
+        use futures_util::StreamExt;
+        self.admin(c)?;
+        let status = p.status.as_deref().unwrap_or("settled");
+        if !matches!(status, "settled" | "pending" | "expired" | "all") {
+            return Err(refuse(code::INVALID, "status must be settled, pending, expired or all"));
+        }
+        let after = match p.cursor.as_deref() {
+            None => None,
+            Some(c) => Some(parse_cursor(c).ok_or_else(|| refuse(code::INVALID, "cursor is not one this node gave"))?),
+        };
+        let limit = p.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE) as usize;
+        let now = (self.now)();
+        let (open, record_error): (Vec<String>, Option<String>) = {
+            let l = lock(&self.ledger);
+            let open = l
+                .records()
+                .filter(|r| r.open(now))
+                .map(|r| r.payment_hash.clone())
+                .collect();
+            (open, l.broken().map(str::to_string))
+        };
+        // A lookup that fails leaves the invoice as it was recorded.
+        let fresh: Vec<Record> = futures_util::stream::iter(open)
+            .map(|h| async move { self.refreshed(&h).await })
+            .buffer_unordered(LOOKUPS_AT_ONCE)
+            .filter_map(|r| async move { r.ok() })
+            .collect()
+            .await;
+        let mut all: Vec<Record> = {
+            let l = lock(&self.ledger);
+            let fresh: std::collections::HashMap<&str, &Record> =
+                fresh.iter().map(|r| (r.payment_hash.as_str(), r)).collect();
+            l.records()
+                .map(|r| (*fresh.get(r.payment_hash.as_str()).unwrap_or(&r)).clone())
+                .collect()
+        };
+        let key = |r: &Record| {
+            (
+                if status == "settled" {
+                    r.settled_at.unwrap_or(0)
+                } else {
+                    r.created_at
+                },
+                r.payment_hash.clone(),
+            )
+        };
+        all.retain(|r| {
+            let k = key(r);
+            (status == "all" || r.state(now) == status)
+                && p.since.is_none_or(|s| k.0 >= s)
+                && after.as_ref().is_none_or(|a| &k > a)
+        });
+        all.sort_by_key(key);
+        let more = all.len() > limit;
+        all.truncate(limit);
+        let next_cursor = more.then(|| {
+            let (t, h) = key(all.last().expect("a page that has more is not empty"));
+            format!("{t}:{h}")
+        });
+        Ok(InvoiceList {
+            invoices: all.iter().map(|r| Self::invoice_view(r, now)).collect(),
+            next_cursor,
+            record_error,
+        })
+    }
+
+    /// Admins only: one invoice made here, checked with the backend.
+    pub async fn lookup_invoice(&self, c: &Caller, p: LookupInvoiceParams) -> Result<InvoiceView, Refusal> {
+        self.admin(c)?;
+        let r = self.refreshed(&p.payment_hash).await?;
+        Ok(Self::invoice_view(&r, (self.now)()))
+    }
+
+    /// LUD-21 for gateways: whether an invoice made here for `name` was
+    /// paid. Only what the payer already knows, or learns by paying.
+    pub async fn verify_invoice(&self, c: &Caller, p: VerifyInvoiceParams) -> Result<Verified, Refusal> {
+        self.role(c)?;
+        let r = self.refreshed(&p.payment_hash).await?;
+        if r.name != p.name {
+            return Err(refuse(
+                code::NOT_FOUND,
+                "no invoice with that payment hash was made here",
+            ));
+        }
+        Ok(Verified {
+            settled: r.settled_at.is_some(),
+            preimage: r.preimage.filter(|_| r.settled_at.is_some()),
+            pr: r.pr,
         })
     }
 
@@ -546,6 +754,298 @@ pub mod tests {
             Some(crate::bolt11::testutil::node_pubkey())
         );
         assert_eq!(svc.config().backend.kind, Kind::Lnd);
+    }
+
+    fn list(
+        status: Option<&str>,
+        since: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> ListInvoicesParams {
+        ListInvoicesParams {
+            status: status.map(str::to_string),
+            since,
+            cursor,
+            limit,
+        }
+    }
+
+    fn verify(name: &str, hash: &str) -> VerifyInvoiceParams {
+        VerifyInvoiceParams {
+            name: name.into(),
+            payment_hash: hash.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn invoices_are_recorded_with_their_comment_and_payments_are_seen() {
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        NOW.store(crate::unix_now(), Ordering::SeqCst);
+        let fake = Arc::new(Fake::default());
+        let url = serve(fake.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&url, Kind::Lnd, dir.path());
+        let svc = Service::with_clock(cfg.clone(), || NOW.load(Ordering::SeqCst));
+        let (gw, admin) = (caller(&gateway_keys()), caller(&admin_keys()));
+        assert!(svc.list_addresses(&gw).unwrap().verifies);
+        let mut hashes = Vec::new();
+        for (i, comment) in [Some("order 42"), None, Some("")].into_iter().enumerate() {
+            let mut p = params("alice", 1_000 * (i as u64 + 1));
+            p.comment = comment.map(str::to_string);
+            hashes.push(svc.make_invoice(&gw, p).await.unwrap().payment_hash);
+        }
+        let (paid, other, third) = (&hashes[0], &hashes[1], &hashes[2]);
+
+        // Unpaid: pending, no preimage.
+        let v = svc.verify_invoice(&gw, verify("alice", paid)).await.unwrap();
+        assert!(!v.settled && v.preimage.is_none() && v.pr.starts_with("lnbcrt"));
+        let all = svc
+            .list_invoices(&admin, list(Some("pending"), None, None, None))
+            .await
+            .unwrap();
+        assert_eq!(all.invoices.len(), 3);
+        assert!(all.next_cursor.is_none() && all.record_error.is_none());
+        assert!(svc
+            .list_invoices(&admin, list(None, None, None, None))
+            .await
+            .unwrap()
+            .invoices
+            .is_empty());
+
+        // Paid: the backend was asked a moment ago, so it is asked again only after the gap.
+        fake.pay(paid);
+        let calls = fake.calls.load(Ordering::SeqCst);
+        assert!(!svc.verify_invoice(&gw, verify("alice", paid)).await.unwrap().settled);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), calls, "not asked again so soon");
+        NOW.fetch_add(CHECK_GAP_SECS, Ordering::SeqCst);
+        let v = svc.verify_invoice(&gw, verify("alice", paid)).await.unwrap();
+        assert!(v.settled && v.preimage.is_some());
+        // Settled is final: the backend is not asked any more.
+        let calls = fake.calls.load(Ordering::SeqCst);
+        NOW.fetch_add(CHECK_GAP_SECS, Ordering::SeqCst);
+        assert!(svc.verify_invoice(&gw, verify("alice", paid)).await.unwrap().settled);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), calls);
+
+        let one = svc
+            .lookup_invoice(
+                &admin,
+                LookupInvoiceParams {
+                    payment_hash: paid.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(one.comment.as_deref(), Some("order 42"));
+        assert_eq!(
+            (one.state.as_str(), one.name.as_str(), one.amount_msat),
+            ("settled", "alice", 1_000)
+        );
+        assert_eq!(one.settled_at, Some(1_700_000_000));
+        assert!(one.expires_at > one.created_at);
+        let settled = svc.list_invoices(&admin, list(None, None, None, None)).await.unwrap();
+        assert_eq!(settled.invoices, vec![one.clone()]);
+        assert!(svc
+            .list_invoices(&admin, list(None, Some(1_700_000_001), None, None))
+            .await
+            .unwrap()
+            .invoices
+            .is_empty());
+
+        // Paged, oldest first, with no comment where none (or an empty one) was sent.
+        fake.pay(other);
+        fake.pay(third);
+        NOW.fetch_add(CHECK_GAP_SECS, Ordering::SeqCst);
+        let page = svc
+            .list_invoices(&admin, list(Some("all"), None, None, Some(2)))
+            .await
+            .unwrap();
+        assert_eq!(page.invoices.len(), 2);
+        let next = svc
+            .list_invoices(&admin, list(Some("all"), None, page.next_cursor.clone(), Some(2)))
+            .await
+            .unwrap();
+        assert_eq!(next.invoices.len(), 1);
+        assert!(next.next_cursor.is_none());
+        let mut seen: Vec<String> = page
+            .invoices
+            .iter()
+            .chain(&next.invoices)
+            .map(|i| i.payment_hash.clone())
+            .collect();
+        seen.sort();
+        let mut want = hashes.clone();
+        want.sort();
+        assert_eq!(seen, want);
+        assert!(page.invoices.iter().chain(&next.invoices).all(|i| i.state == "settled"));
+        assert!(page
+            .invoices
+            .iter()
+            .chain(&next.invoices)
+            .filter(|i| i.payment_hash != *paid)
+            .all(|i| i.comment.is_none()));
+
+        // Kept across a restart.
+        let again = Service::with_clock(cfg, || NOW.load(Ordering::SeqCst));
+        let v = again.verify_invoice(&gw, verify("alice", paid)).await.unwrap();
+        assert!(v.settled);
+        svc.make_invoice(&gw, params("alice", 5_000)).await.unwrap();
+        // The test backend's invoices last an hour.
+        let later = NOW.fetch_add(3601, Ordering::SeqCst) + 3601;
+        let event = EventBuilder::text_note("req")
+            .custom_created_at(Timestamp::from(later))
+            .sign_with_keys(&admin_keys())
+            .unwrap();
+        let admin = Caller {
+            event: Some(event),
+            ..admin
+        };
+        let expired = svc
+            .list_invoices(&admin, list(Some("expired"), None, None, None))
+            .await
+            .unwrap();
+        assert_eq!(expired.invoices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_invoices_made_here_are_answered_and_only_admins_see_them_all() {
+        let (svc, fake, _dir) = rig(Kind::Lnd).await;
+        let (gw, admin) = (caller(&gateway_keys()), caller(&admin_keys()));
+        let hash = svc
+            .make_invoice(&gw, params("alice", 1_000))
+            .await
+            .unwrap()
+            .payment_hash;
+        let code_of = |r: Result<Verified, Refusal>| r.unwrap_err().code;
+        // Not made here: the backend is never asked.
+        let calls = fake.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            code_of(svc.verify_invoice(&gw, verify("alice", &"00".repeat(32))).await),
+            code::NOT_FOUND
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            code_of(svc.verify_invoice(&gw, verify("bob", &hash)).await),
+            code::NOT_FOUND
+        );
+        assert_eq!(
+            code_of(svc.verify_invoice(&gw, verify("alice", "nope")).await),
+            code::INVALID
+        );
+        assert_eq!(
+            code_of(
+                svc.verify_invoice(&caller(&Keys::generate()), verify("alice", &hash))
+                    .await
+            ),
+            code::UNAUTHORIZED
+        );
+        assert_eq!(
+            svc.list_invoices(&gw, list(None, None, None, None))
+                .await
+                .unwrap_err()
+                .code,
+            code::UNAUTHORIZED
+        );
+        assert_eq!(
+            svc.lookup_invoice(
+                &gw,
+                LookupInvoiceParams {
+                    payment_hash: hash.clone()
+                }
+            )
+            .await
+            .unwrap_err()
+            .code,
+            code::UNAUTHORIZED
+        );
+        for bad in [
+            list(Some("paid"), None, None, None),
+            list(None, None, Some("x".into()), None),
+            list(None, None, Some(format!("1:{}", "Z".repeat(64))), None),
+            list(None, None, Some(format!("t:{hash}")), None),
+        ] {
+            assert_eq!(svc.list_invoices(&admin, bad).await.unwrap_err().code, code::INVALID);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_say_or_lies_is_not_believed() {
+        let (svc, fake, _dir) = rig(Kind::Lnd).await;
+        let (gw, admin) = (caller(&gateway_keys()), caller(&admin_keys()));
+        let hash = svc
+            .make_invoice(&gw, params("alice", 1_000))
+            .await
+            .unwrap()
+            .payment_hash;
+        fake.pay(&hash);
+        *fake.wrong_preimage.lock().unwrap() = Some("11".repeat(32));
+        let e = svc.verify_invoice(&gw, verify("alice", &hash)).await.unwrap_err();
+        assert_eq!(e.code, code::BACKEND);
+        assert!(svc.last_error().unwrap().contains("does not match"));
+        *fake.wrong_preimage.lock().unwrap() = None;
+        *fake.fail.lock().unwrap() = Some((500, "down".into()));
+        tokio::time::sleep(Duration::from_secs(CHECK_GAP_SECS)).await;
+        assert_eq!(
+            svc.verify_invoice(&gw, verify("alice", &hash)).await.unwrap_err().code,
+            code::BACKEND
+        );
+        // A listing leaves an invoice the backend could not say about as it was.
+        tokio::time::sleep(Duration::from_secs(CHECK_GAP_SECS)).await;
+        let all = svc
+            .list_invoices(&admin, list(Some("all"), None, None, None))
+            .await
+            .unwrap();
+        assert_eq!(all.invoices[0].state, "pending");
+    }
+
+    #[tokio::test]
+    async fn invoices_are_still_made_when_they_cannot_be_recorded() {
+        let fake = Arc::new(Fake::default());
+        let url = serve(fake.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(crate::node::invoices::FILE);
+        std::fs::write(&file, "").unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        let svc = Service::new(test_config(&url, Kind::Lnd, dir.path()));
+        let (gw, admin) = (caller(&gateway_keys()), caller(&admin_keys()));
+        assert!(svc.make_invoice(&gw, params("alice", 1_000)).await.is_ok());
+        let l = svc
+            .list_invoices(&admin, list(Some("all"), None, None, None))
+            .await
+            .unwrap();
+        assert!(l.invoices.is_empty() && l.record_error.unwrap().contains("readable by other users"));
+        // A payment seen then cannot be recorded either, and is still reported.
+        let mut r = crate::node::invoices::Record {
+            payment_hash: "ab".repeat(32),
+            name: "alice".into(),
+            domain: "pay.example".into(),
+            amount_msat: 1,
+            comment: None,
+            pr: "lnbcrt1".into(),
+            created_at: crate::unix_now(),
+            expires_at: crate::unix_now() + 600,
+            settled_at: None,
+            preimage: None,
+        };
+        // One in memory as if it had been read, and paid on the backend.
+        let pr = backend_invoice(&url).await;
+        r.payment_hash = crate::bolt11::payment_hash(&pr).unwrap();
+        r.pr = pr;
+        fake.pay(&r.payment_hash);
+        lock(&svc.ledger).insert(r.clone());
+        let v = svc.verify_invoice(&gw, verify("alice", &r.payment_hash)).await.unwrap();
+        assert!(v.settled);
+    }
+
+    async fn backend_invoice(url: &str) -> String {
+        let b = Backend::new(Kind::Lnd, url, SECRET.into(), None, Duration::from_secs(5));
+        b.create_invoice(&Request {
+            amount_msat: 1_000,
+            metadata: "[]",
+            expiry_secs: 600,
+            label: "l",
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test]

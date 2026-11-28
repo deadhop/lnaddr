@@ -68,7 +68,8 @@ Do not edit the copies in place.
 ## Demo stage
 
 `demo/` is its own crate: a Nostr relay on `ws://127.0.0.1:7788` and a fake LND on
-`http://127.0.0.1:18080` (macaroon `demo`) that signs regtest invoices nothing can pay.
+`http://127.0.0.1:18080` (macaroon `demo`) that signs regtest invoices nothing can pay;
+`POST /demo/pay/<payment hash>` marks one paid, so LUD-21 `verify` can be tried end to end.
 
 ```sh
 (cd demo && cargo run --release)
@@ -82,9 +83,9 @@ Run both binaries against it to try a change by hand (the operator skill
 
 | Path | What |
 | --- | --- |
-| `src/node/` | config layers, backends, MCP tools, network engine glue, request loop, CLI |
+| `src/node/` | config layers, backends, MCP tools, the invoice record (`invoices.rs`), network engine glue, request loop, CLI |
 | `src/gateway/` | config, node directory and cache, public HTTP, admin web, network, console server, CLI |
-| `src/lnurl.rs`, `src/bolt11.rs` | LUD-06/12/16 and the invoice checks both sides share |
+| `src/lnurl.rs`, `src/bolt11.rs` | LUD-06/12/16/21 and the invoice checks both sides share |
 | `src/settings.rs` | config parsing and the `sources` locks |
 | `tests/binaries.rs` | the binaries as processes |
 

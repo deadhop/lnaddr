@@ -2,9 +2,11 @@
 //!
 //!   GET /.well-known/lnurlp/<name>            LUD-06 pay parameters (from the cache)
 //!   GET /.well-known/lnurlp/<name>/callback   an invoice (asks the node over ContextVM)
+//!   GET /.well-known/lnurlp/<name>/verify/<payment hash>
+//!                                             whether it was paid (LUD-21; asks the node)
 //!   GET /healthz                              ok / degraded, nothing else
 //!
-//! Both LNURL paths share one prefix, so a reverse proxy forwards a single
+//! The LNURL paths share one prefix, so a reverse proxy forwards a single
 //! location. Nothing else is mounted here: the admin interface has its own
 //! listener and is unreachable from this one.
 
@@ -22,7 +24,7 @@ use serde_json::json;
 use crate::gateway::config::{Config, Listen};
 use crate::gateway::nodes::{Directory, Fail};
 use crate::gateway::server::Peer;
-use crate::lnurl::{self, ErrorResponse, InvoiceResponse, PayRequest};
+use crate::lnurl::{self, ErrorResponse, InvoiceResponse, PayRequest, VerifyResponse};
 use crate::ratelimit::RateLimiter;
 
 pub struct Public {
@@ -30,6 +32,7 @@ pub struct Public {
     pub dir: Arc<Directory>,
     params_limit: RateLimiter,
     invoice_limit: RateLimiter,
+    verify_limit: RateLimiter,
 }
 
 impl Public {
@@ -49,6 +52,11 @@ impl Public {
                 l.per_ip_per_minute.saturating_mul(4),
             ),
             invoice_limit: RateLimiter::new(l.global_per_minute, l.per_ip_per_minute),
+            // A wallet polls verification while the payer pays: a budget of its own.
+            verify_limit: RateLimiter::new(
+                l.global_per_minute.saturating_mul(4),
+                l.per_ip_per_minute.saturating_mul(4),
+            ),
             cfg,
             dir,
         }
@@ -204,11 +212,53 @@ async fn callback(
     }
     let comment = q.get("comment").filter(|c| !c.is_empty()).cloned();
     match p.dir.invoice(&name, &domain, amount, comment).await {
-        Ok(pr) => {
-            let body = InvoiceResponse { pr, routes: vec![] };
+        Ok(issued) => {
+            let verify = issued.verifies.then(|| {
+                format!(
+                    "{}/.well-known/lnurlp/{name}/verify/{}",
+                    p.cfg.origin(&domain),
+                    issued.payment_hash
+                )
+            });
+            let body = InvoiceResponse {
+                pr: issued.pr,
+                routes: vec![],
+                verify,
+            };
             reply(
                 200,
                 serde_json::to_string(&body).expect("an invoice always serialises"),
+                "no-store",
+            )
+        }
+        Err(f) => error(f),
+    }
+}
+
+async fn verify(
+    State(p): State<Arc<Public>>,
+    Path((raw, payment_hash)): Path<(String, String)>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+) -> Response {
+    let (Some(name), Some(domain)) = (normalise(&raw), p.domain(&headers, p.trusted(peer))) else {
+        return error(Fail::NoInvoice);
+    };
+    if !p.verify_limit.allow(&p.client_ip(peer, &headers), crate::unix_now()) {
+        return error(Fail::RateLimited);
+    }
+    match p.dir.verify(&name, &domain, &payment_hash).await {
+        Ok(v) => {
+            let body = VerifyResponse {
+                status: "OK".into(),
+                settled: v.settled,
+                preimage: v.preimage,
+                pr: v.pr,
+            };
+            // Never cached: an answer of "not yet" must not outlive the payment.
+            reply(
+                200,
+                serde_json::to_string(&body).expect("a verification always serialises"),
                 "no-store",
             )
         }
@@ -240,6 +290,10 @@ pub fn router(p: Arc<Public>) -> Router {
     Router::new()
         .route("/.well-known/lnurlp/{name}", get(pay_params).options(preflight))
         .route("/.well-known/lnurlp/{name}/callback", get(callback).options(preflight))
+        .route(
+            "/.well-known/lnurlp/{name}/verify/{payment_hash}",
+            get(verify).options(preflight),
+        )
         .route("/healthz", get(healthz))
         .fallback(not_found)
         .with_state(p)

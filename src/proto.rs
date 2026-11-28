@@ -14,6 +14,9 @@ pub const GET_CONFIG: &str = "get_config";
 pub const SET_ADDRESS: &str = "set_address";
 pub const REMOVE_ADDRESS: &str = "remove_address";
 pub const SET_LIMITS: &str = "set_limits";
+pub const LIST_INVOICES: &str = "list_invoices";
+pub const LOOKUP_INVOICE: &str = "lookup_invoice";
+pub const VERIFY_INVOICE: &str = "verify_invoice";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +53,9 @@ pub struct AddressList {
     /// The Lightning node key that signed this node's last invoice, if any.
     pub payee: Option<String>,
     pub network: String,
+    /// Whether the node answers `verify_invoice` (older nodes do not).
+    #[serde(default)]
+    pub verifies: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -168,6 +174,80 @@ impl SetLimitsParams {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListInvoicesParams {
+    /// `settled` (the default), `pending`, `expired` or `all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Only invoices settled (or, for the other statuses, made) at or after
+    /// this time, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
+    /// The `next_cursor` of the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// At most this many (default 100, at most 1000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One invoice the node made, as an admin sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct InvoiceView {
+    pub payment_hash: String,
+    pub name: String,
+    pub domain: String,
+    pub amount_msat: u64,
+    /// The payer's LUD-12 comment.
+    pub comment: Option<String>,
+    pub pr: String,
+    /// `settled`, `pending` or `expired`.
+    pub state: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub settled_at: Option<u64>,
+    pub preimage: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct InvoiceList {
+    /// Oldest first: by when they were settled, or made.
+    pub invoices: Vec<InvoiceView>,
+    /// Pass as `cursor` for the next page; none on the last one.
+    pub next_cursor: Option<String>,
+    /// Why invoices are not being recorded, if they are not.
+    pub record_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LookupInvoiceParams {
+    pub payment_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyInvoiceParams {
+    /// The address the invoice was made for.
+    pub name: String,
+    pub payment_hash: String,
+}
+
+/// What LUD-21 tells a payer: nothing about the address or the comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Verified {
+    pub settled: bool,
+    /// Only once settled.
+    pub preimage: Option<String>,
+    pub pr: String,
+}
+
+/// Whether `s` is a payment hash: 64 lower-case hex digits.
+pub fn valid_payment_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Error codes in `error.data.code`, the same on both sides.
 pub mod code {
     pub const UNAUTHORIZED: &str = "unauthorized";
@@ -185,6 +265,26 @@ pub mod code {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payment_hashes_are_lower_case_hex() {
+        assert!(valid_payment_hash(&"ab".repeat(32)));
+        for bad in [
+            "".to_string(),
+            "ab".repeat(31),
+            "AB".repeat(32),
+            "zz".repeat(32),
+            "ab".repeat(33),
+        ] {
+            assert!(!valid_payment_hash(&bad), "{bad}");
+        }
+        // An older node's list says nothing about verifying.
+        let old: AddressList = serde_json::from_value(serde_json::json!({
+            "addresses": [], "payee": null, "network": "regtest"
+        }))
+        .unwrap();
+        assert!(!old.verifies);
+    }
 
     #[test]
     fn addresses_know_their_domains() {
