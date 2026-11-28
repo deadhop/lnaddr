@@ -86,7 +86,7 @@ the keys change.
 | `LNADDR_NODE_BACKEND` | Credential (`LNADDR_NODE_BACKEND_SECRET_FILE`) | Pin |
 | --- | --- | --- |
 | `lnd` | `invoice.macaroon` (binary is fine, read as hex) | `LNADDR_NODE_BACKEND_TLS_CERT_FILE=tls.cert` |
-| `cln` | a rune from `lightning-cli createrune restrictions='[["method=invoice"],["rate=60"]]'` | clnrest's `server.pem`, or `LNADDR_NODE_BACKEND_TLS_CERT_SHA256` |
+| `cln` | a rune from `lightning-cli createrune restrictions='[["method=invoice","method=listinvoices"],["rate=60"]]'` (`listinvoices` lets the node see payments; without it, LUD-21 `verify` and `list_invoices` fail) | clnrest's `server.pem`, or `LNADDR_NODE_BACKEND_TLS_CERT_SHA256` |
 | `phoenixd` | `http-password-limited-access` from `phoenix.conf` | none (plain http on loopback) |
 | `lnbits` | the wallet's invoice/read key, not the admin key | web roots, or a pin |
 
@@ -177,7 +177,9 @@ values. Setting tables: node.md and gateway.md.
 ## Try it without a Lightning node
 
 `demo/` starts a Nostr relay on `ws://127.0.0.1:7788` and a fake LND on
-`http://127.0.0.1:18080` (macaroon `demo`) that signs real regtest invoices nothing can pay:
+`http://127.0.0.1:18080` (macaroon `demo`) that signs real regtest invoices nothing can pay
+(`curl -X POST http://127.0.0.1:18080/demo/pay/<payment hash>` marks one paid, for trying the
+callback's LUD-21 `verify` URL):
 
 ```sh
 (cd demo && cargo run --release)

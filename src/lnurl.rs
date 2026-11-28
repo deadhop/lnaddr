@@ -67,7 +67,12 @@ pub fn metadata(name: &str, domain: &str, description: &str) -> String {
 
 /// SHA-256 of the metadata string: the invoice's description hash.
 pub fn description_hash(metadata: &str) -> [u8; 32] {
-    sha256::Hash::hash(metadata.as_bytes()).to_byte_array()
+    sha256(metadata.as_bytes())
+}
+
+/// SHA-256, as a payment hash is of its preimage.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    sha256::Hash::hash(bytes).to_byte_array()
 }
 
 /// First LUD-06 response: what the wallet shows before asking for an amount.
@@ -83,11 +88,23 @@ pub struct PayRequest {
     pub comment_allowed: Option<u16>,
 }
 
-/// Second LUD-06 response: the invoice.
+/// Second LUD-06 response: the invoice, and where to ask whether it was
+/// paid (LUD-21).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvoiceResponse {
     pub pr: String,
     pub routes: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<String>,
+}
+
+/// LUD-21 answer: whether the invoice was paid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyResponse {
+    pub status: String,
+    pub settled: bool,
+    pub preimage: Option<String>,
+    pub pr: String,
 }
 
 /// LUD-06 error body.
@@ -199,9 +216,21 @@ mod tests {
         let i = serde_json::to_value(InvoiceResponse {
             pr: "lnbc1".into(),
             routes: vec![],
+            verify: None,
         })
         .unwrap();
         assert_eq!(i, serde_json::json!({"pr": "lnbc1", "routes": []}));
+        let v = serde_json::to_value(VerifyResponse {
+            status: "OK".into(),
+            settled: false,
+            preimage: None,
+            pr: "lnbc1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"status": "OK", "settled": false, "preimage": null, "pr": "lnbc1"})
+        );
     }
 
     #[test]

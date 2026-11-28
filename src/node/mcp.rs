@@ -16,8 +16,9 @@ use serde_json::json;
 use crate::node::network::{NodeHealth, NodeInfo};
 use crate::node::service::{Refusal, Role, Service};
 use crate::proto::{
-    self, code, AddressList, ConfigView, MadeInvoice, MakeInvoiceParams, RemoveAddressParams, SetAddressParams,
-    SetLimitsParams, Status,
+    self, code, AddressList, ConfigView, InvoiceList, InvoiceView, ListInvoicesParams, LookupInvoiceParams,
+    MadeInvoice, MakeInvoiceParams, RemoveAddressParams, SetAddressParams, SetLimitsParams, Status, Verified,
+    VerifyInvoiceParams,
 };
 use deadhop_netengine::tools::tool_page;
 use deadhop_netengine::view::{NetworkView, UpdateNetworkParams};
@@ -63,7 +64,7 @@ impl NodeServer {
 }
 
 /// The tools a gateway may see and call; every other tool is for admins.
-pub const GATEWAY_TOOLS: [&str; 2] = [proto::LIST_ADDRESSES, proto::MAKE_INVOICE];
+pub const GATEWAY_TOOLS: [&str; 3] = [proto::LIST_ADDRESSES, proto::MAKE_INVOICE, proto::VERIFY_INVOICE];
 
 #[tool_router(router = own_tools)]
 impl NodeServer {
@@ -89,6 +90,54 @@ impl NodeServer {
     ) -> Result<Json<MadeInvoice>, ErrorData> {
         self.svc
             .make_invoice(&caller_from(&ctx.extensions), p)
+            .await
+            .map(Json)
+            .map_err(rpc_error)
+    }
+
+    #[tool(
+        name = "verify_invoice",
+        description = "Whether an invoice this node made for an address was paid (LUD-21): settled, the preimage once paid, and the invoice."
+    )]
+    async fn verify_invoice(
+        &self,
+        Parameters(p): Parameters<VerifyInvoiceParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<Verified>, ErrorData> {
+        self.svc
+            .verify_invoice(&caller_from(&ctx.extensions), p)
+            .await
+            .map(Json)
+            .map_err(rpc_error)
+    }
+
+    #[tool(
+        name = "list_invoices",
+        description = "Admins only: the invoices this node made, oldest first, with each payer's comment. status is settled (the default), pending, expired or all; since is a Unix time; pass next_cursor back as cursor for the next page."
+    )]
+    async fn list_invoices(
+        &self,
+        Parameters(p): Parameters<ListInvoicesParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<InvoiceList>, ErrorData> {
+        self.svc
+            .list_invoices(&caller_from(&ctx.extensions), p)
+            .await
+            .map(Json)
+            .map_err(rpc_error)
+    }
+
+    #[tool(
+        name = "lookup_invoice",
+        description = "Admins only: one invoice this node made, by payment hash, with the payer's comment and whether it was paid."
+    )]
+    async fn lookup_invoice(
+        &self,
+        Parameters(p): Parameters<LookupInvoiceParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<InvoiceView>, ErrorData> {
+        self.svc
+            .lookup_invoice(&caller_from(&ctx.extensions), p)
             .await
             .map(Json)
             .map_err(rpc_error)
@@ -286,9 +335,12 @@ impl deadhop_netengine::tools::NetworkServer for NodeServer {
 }
 
 /// The node's own tool names, so both sides agree on them.
-pub const TOOLS: [&str; 7] = [
+pub const TOOLS: [&str; 10] = [
     proto::LIST_ADDRESSES,
     proto::MAKE_INVOICE,
+    proto::VERIFY_INVOICE,
+    proto::LIST_INVOICES,
+    proto::LOOKUP_INVOICE,
     proto::GET_STATUS,
     proto::GET_CONFIG,
     proto::SET_ADDRESS,
@@ -350,6 +402,7 @@ mod tests {
             ("get_network", serde_json::json!({})),
             ("update_network", serde_json::json!({ "patch": {} })),
             ("reset_network", serde_json::json!({})),
+            ("list_invoices", serde_json::json!({ "status": "all" })),
         ] {
             let v = admin.call_value(tool, args).await.unwrap();
             assert!(v.is_object(), "{tool}: {v}");
@@ -378,6 +431,24 @@ mod tests {
             .iter()
             .all(|c| c["id"] != "electrum_network"));
         assert!(ports.is_some());
+        for (who, tool, args) in [
+            (
+                &gw,
+                "verify_invoice",
+                serde_json::json!({ "name": "alice", "payment_hash": "00".repeat(32) }),
+            ),
+            (
+                &admin,
+                "lookup_invoice",
+                serde_json::json!({ "payment_hash": "00".repeat(32) }),
+            ),
+        ] {
+            let e = who.call_value(tool, args).await.unwrap_err();
+            assert!(
+                matches!(&e, CallError::Refused { code, .. } if code == "not_found"),
+                "{tool}: {e:?}"
+            );
+        }
         gw.close().await;
         admin.close().await;
         node.until(Box::pin(async {})).await.unwrap();

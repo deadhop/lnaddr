@@ -466,7 +466,8 @@ async fn test_command(cfg: &Config, args: &[String], out: &mut dyn Write) -> Res
         let pr = dir
             .invoice(&name, &domain, amount * 1000, None)
             .await
-            .map_err(|f| f.reason())?;
+            .map_err(|f| f.reason())?
+            .pr;
         let _ = writeln!(out, "  invoice    {pr}");
         let _ = writeln!(
             out,

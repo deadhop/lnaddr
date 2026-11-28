@@ -1,7 +1,8 @@
-//! Lightning backends. Each one only ever creates invoices, and each is
-//! meant to run with its invoice-only credential: LND's invoice.macaroon, a
-//! Core Lightning rune restricted to `method=invoice`, phoenixd's limited
-//! password, or an LNbits invoice key. Nothing here can spend.
+//! Lightning backends. Each one only ever creates invoices and reads them
+//! back, and each is meant to run with its invoice-only credential: LND's
+//! invoice.macaroon, a Core Lightning rune restricted to `method=invoice` and
+//! `method=listinvoices`, phoenixd's limited password, or an LNbits invoice
+//! key. Nothing here can spend.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -172,6 +173,80 @@ impl Backend {
                     "extra": { "tag": "lnaddr", "label": r.label },
                 })),
         };
+        let v = self.send(req).await?;
+        // Older LNbits versions name the invoice `payment_request` only.
+        let (field, fallback) = match self.kind {
+            Kind::Lnd => ("payment_request", "payment_request"),
+            Kind::Cln => ("bolt11", "bolt11"),
+            Kind::Phoenixd => ("serialized", "serialized"),
+            Kind::Lnbits => ("bolt11", "payment_request"),
+        };
+        v.get(field)
+            .or_else(|| v.get(fallback))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("the {} backend's reply has no {field}", self.kind.name()))
+    }
+
+    /// Whether the invoice with this payment hash (hex) was paid: its
+    /// preimage (hex) and, when the backend says, when. Every backend reads
+    /// invoices with the credential that makes them, except a Core Lightning
+    /// rune, which must also allow `listinvoices`.
+    pub async fn lookup_invoice(&self, payment_hash: &str) -> Result<Option<Paid>, String> {
+        let req = match self.kind {
+            Kind::Lnd => self
+                .http
+                .get(format!("{}/v1/invoice/{payment_hash}", self.base))
+                .header("Grpc-Metadata-macaroon", &self.secret),
+            Kind::Cln => self
+                .http
+                .post(format!("{}/v1/listinvoices", self.base))
+                .header("Rune", &self.secret)
+                .json(&json!({ "payment_hash": payment_hash })),
+            Kind::Phoenixd => self
+                .http
+                .get(format!("{}/payments/incoming/{payment_hash}", self.base))
+                .basic_auth("", Some(&self.secret)),
+            Kind::Lnbits => self
+                .http
+                .get(format!("{}/api/v1/payments/{payment_hash}", self.base))
+                .header("X-Api-Key", &self.secret),
+        };
+        let v = self.send(req).await?;
+        let text = |v: &Value| v.as_str().map(str::to_string);
+        let secs = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+        let (paid, preimage, at) = match self.kind {
+            Kind::Lnd => (
+                v["state"] == "SETTLED",
+                text(&v["r_preimage"])
+                    .and_then(|p| base64::engine::general_purpose::STANDARD.decode(p).ok())
+                    .map(hex::encode),
+                secs(&v["settle_date"]),
+            ),
+            Kind::Cln => {
+                let i = &v["invoices"][0];
+                (i["status"] == "paid", text(&i["payment_preimage"]), secs(&i["paid_at"]))
+            }
+            Kind::Phoenixd => (
+                v["isPaid"] == true,
+                text(&v["preimage"]),
+                secs(&v["completedAt"]).map(|ms| ms / 1000),
+            ),
+            Kind::Lnbits => (v["paid"] == true, text(&v["preimage"]), None),
+        };
+        if !paid {
+            return Ok(None);
+        }
+        let preimage =
+            preimage.ok_or_else(|| format!("the {} backend says paid but gives no preimage", self.kind.name()))?;
+        Ok(Some(Paid {
+            preimage,
+            at: at.filter(|t| *t > 0),
+        }))
+    }
+
+    /// Send a request and read its JSON reply, explaining any failure in one line.
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value, String> {
         let resp = req
             .send()
             .await
@@ -189,35 +264,32 @@ impl Backend {
                 excerpt(&body)
             ));
         }
-        let v: Value = serde_json::from_str(&body).map_err(|_| {
+        serde_json::from_str(&body).map_err(|_| {
             format!(
                 "the {} backend did not answer with JSON: {}",
                 self.kind.name(),
                 excerpt(&body)
             )
-        })?;
-        // Older LNbits versions name the invoice `payment_request` only.
-        let (field, fallback) = match self.kind {
-            Kind::Lnd => ("payment_request", "payment_request"),
-            Kind::Cln => ("bolt11", "bolt11"),
-            Kind::Phoenixd => ("serialized", "serialized"),
-            Kind::Lnbits => ("bolt11", "payment_request"),
-        };
-        v.get(field)
-            .or_else(|| v.get(fallback))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| format!("the {} backend's reply has no {field}", self.kind.name()))
+        })
     }
+}
+
+/// A paid invoice, as its backend reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paid {
+    /// Hex.
+    pub preimage: String,
+    /// Seconds since the Unix epoch, when the backend says.
+    pub at: Option<u64>,
 }
 
 #[cfg(test)]
 pub mod testutil {
     //! A fake of all four backend APIs that issues real, signed invoices.
     use super::*;
-    use axum::extract::{Form, State};
+    use axum::extract::{Form, Path, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -233,9 +305,71 @@ pub mod testutil {
         pub delay: Mutex<Option<Duration>>,
         pub calls: AtomicU32,
         pub last: Mutex<Option<(HeaderMap, Value)>>,
+        /// Every invoice made: payment hash → (preimage, paid), both hex.
+        pub invoices: Mutex<HashMap<String, (String, bool)>>,
+        /// Report paid invoices with this preimage instead.
+        pub wrong_preimage: Mutex<Option<String>>,
+    }
+
+    impl Fake {
+        /// Mark an invoice paid.
+        pub fn pay(&self, payment_hash: &str) {
+            self.invoices.lock().unwrap().get_mut(payment_hash).unwrap().1 = true;
+        }
     }
 
     pub const SECRET: &str = "s3cret";
+
+    fn authed(headers: &HeaderMap, kind: Kind) -> bool {
+        match kind {
+            Kind::Lnd => headers.get("grpc-metadata-macaroon").is_some_and(|v| v == SECRET),
+            Kind::Cln => headers.get("rune").is_some_and(|v| v == SECRET),
+            Kind::Phoenixd => headers.get("authorization").is_some_and(|v| {
+                v.to_str().unwrap()
+                    == format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode(format!(":{SECRET}"))
+                    )
+            }),
+            Kind::Lnbits => headers.get("x-api-key").is_some_and(|v| v == SECRET),
+        }
+    }
+
+    /// The lookup endpoints: whether the invoice is paid, in each backend's words.
+    async fn look(fake: &Fake, headers: HeaderMap, payment_hash: String, kind: Kind) -> (StatusCode, String) {
+        fake.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some((status, body)) = fake.fail.lock().unwrap().clone() {
+            return (StatusCode::from_u16(status).unwrap(), body);
+        }
+        if !authed(&headers, kind) {
+            return (StatusCode::UNAUTHORIZED, "{\"error\":\"bad credential\"}".into());
+        }
+        let Some((preimage, paid)) = fake.invoices.lock().unwrap().get(&payment_hash).cloned() else {
+            return (
+                StatusCode::NOT_FOUND,
+                "{\"message\":\"unable to locate invoice\"}".into(),
+            );
+        };
+        let preimage = fake.wrong_preimage.lock().unwrap().clone().unwrap_or(preimage);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(hex::decode(&preimage).unwrap());
+        let body = match (kind, paid) {
+            (Kind::Lnd, true) => json!({ "state": "SETTLED", "r_preimage": b64, "settle_date": "1700000000" }),
+            (Kind::Lnd, false) => json!({ "state": "OPEN", "r_preimage": b64, "settle_date": "0" }),
+            (Kind::Cln, _) => json!({ "invoices": [{
+                "status": if paid { "paid" } else { "unpaid" },
+                "payment_preimage": paid.then_some(&preimage),
+                "paid_at": paid.then_some(1_700_000_000u64),
+            }] }),
+            // phoenixd gives the preimage whether or not it was paid.
+            (Kind::Phoenixd, _) => json!({
+                "isPaid": paid,
+                "preimage": preimage,
+                "completedAt": paid.then_some(1_700_000_000_000u64),
+            }),
+            (Kind::Lnbits, _) => json!({ "paid": paid, "preimage": paid.then_some(&preimage) }),
+        };
+        (StatusCode::OK, body.to_string())
+    }
 
     async fn answer(fake: &Fake, headers: HeaderMap, body: Value, kind: Kind) -> (StatusCode, String) {
         fake.calls.fetch_add(1, Ordering::SeqCst);
@@ -247,19 +381,7 @@ pub mod testutil {
         if let Some((status, body)) = fake.fail.lock().unwrap().clone() {
             return (StatusCode::from_u16(status).unwrap(), body);
         }
-        let authed = match kind {
-            Kind::Lnd => headers.get("grpc-metadata-macaroon").is_some_and(|v| v == SECRET),
-            Kind::Cln => headers.get("rune").is_some_and(|v| v == SECRET),
-            Kind::Phoenixd => headers.get("authorization").is_some_and(|v| {
-                v.to_str().unwrap()
-                    == format!(
-                        "Basic {}",
-                        base64::engine::general_purpose::STANDARD.encode(format!(":{SECRET}"))
-                    )
-            }),
-            Kind::Lnbits => headers.get("x-api-key").is_some_and(|v| v == SECRET),
-        };
-        if !authed {
+        if !authed(&headers, kind) {
             return (StatusCode::UNAUTHORIZED, "{\"error\":\"bad credential\"}".into());
         }
         let num = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap();
@@ -291,7 +413,14 @@ pub mod testutil {
             }
         };
         let msat = fake.wrong_amount.lock().unwrap().unwrap_or(msat);
-        let pr = crate::bolt11::testutil::invoice(msat, hash.try_into().unwrap());
+        let n = fake.calls.load(Ordering::SeqCst);
+        let preimage = description_hash(&format!("preimage {n} {}", crate::unix_now()));
+        let payment_hash = hex::encode(crate::lnurl::sha256(&preimage));
+        fake.invoices
+            .lock()
+            .unwrap()
+            .insert(payment_hash, (hex::encode(preimage), false));
+        let pr = crate::bolt11::testutil::invoice_paying(msat, hash.try_into().unwrap(), preimage);
         let field = match kind {
             Kind::Lnd => "payment_request",
             Kind::Cln | Kind::Lnbits => "bolt11",
@@ -331,6 +460,39 @@ pub mod testutil {
                 post(
                     |State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move {
                         answer(&f, h, b, Kind::Lnbits).await
+                    },
+                ),
+            )
+            .route(
+                "/v1/invoice/{hash}",
+                get(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Path(hash): Path<String>| async move {
+                        look(&f, h, hash, Kind::Lnd).await
+                    },
+                ),
+            )
+            .route(
+                "/v1/listinvoices",
+                post(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Json(b): Json<Value>| async move {
+                        let hash = b["payment_hash"].as_str().unwrap_or_default().to_string();
+                        look(&f, h, hash, Kind::Cln).await
+                    },
+                ),
+            )
+            .route(
+                "/payments/incoming/{hash}",
+                get(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Path(hash): Path<String>| async move {
+                        look(&f, h, hash, Kind::Phoenixd).await
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/payments/{hash}",
+                get(
+                    |State(f): State<Arc<Fake>>, h: HeaderMap, Path(hash): Path<String>| async move {
+                        look(&f, h, hash, Kind::Lnbits).await
                     },
                 ),
             )
@@ -447,6 +609,41 @@ mod tests {
             Backend::new(Kind::Lnd, &url, SECRET.into(), None, Duration::from_secs(1))
         )
         .contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn every_backend_says_whether_an_invoice_was_paid() {
+        let fake = Arc::new(Fake::default());
+        let url = serve(fake.clone()).await;
+        for (kind, at) in [
+            (Kind::Lnd, Some(1_700_000_000)),
+            (Kind::Cln, Some(1_700_000_000)),
+            (Kind::Phoenixd, Some(1_700_000_000)),
+            (Kind::Lnbits, None),
+        ] {
+            let b = Backend::new(kind, &url, SECRET.into(), None, Duration::from_secs(5));
+            let pr = b.create_invoice(&req(21_000)).await.unwrap();
+            let hash = crate::bolt11::payment_hash(&pr).unwrap();
+            assert_eq!(b.lookup_invoice(&hash).await.unwrap(), None, "{kind:?}");
+            fake.pay(&hash);
+            let paid = b.lookup_invoice(&hash).await.unwrap().unwrap();
+            assert_eq!(paid.at, at, "{kind:?}");
+            let preimage = hex::decode(&paid.preimage).unwrap();
+            assert_eq!(hex::encode(crate::lnurl::sha256(&preimage)), hash, "{kind:?}");
+            let unknown = b.lookup_invoice(&"00".repeat(32)).await.unwrap_err();
+            assert!(unknown.contains("answered 404"), "{kind:?}: {unknown}");
+        }
+        let lnbits = Backend::new(Kind::Lnbits, &url, SECRET.into(), None, Duration::from_secs(5));
+        *fake.fail.lock().unwrap() = Some((200, "{\"paid\":true}".into()));
+        let e = lnbits.lookup_invoice(&"00".repeat(32)).await.unwrap_err();
+        assert!(e.contains("says paid but gives no preimage"), "{e}");
+        *fake.fail.lock().unwrap() = None;
+        let bad_key = Backend::new(Kind::Cln, &url, "nope".into(), None, Duration::from_secs(5));
+        assert!(bad_key
+            .lookup_invoice(&"00".repeat(32))
+            .await
+            .unwrap_err()
+            .contains("answered 401"));
     }
 
     #[tokio::test]

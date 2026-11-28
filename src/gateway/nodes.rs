@@ -26,7 +26,7 @@ use crate::cvm::{CallError, NodeClient};
 use crate::gateway::config::NodeConfig;
 use crate::gateway::network::{Conn, Network as Net, GATEWAY_LANE};
 use crate::lnurl;
-use crate::proto::{self, code, AddressInfo, AddressList, MadeInvoice};
+use crate::proto::{self, code, AddressInfo, AddressList, MadeInvoice, Verified};
 
 /// A refused or failed request, as the public HTTP side reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,8 @@ pub enum Fail {
     RateLimited,
     Unavailable,
     BadInvoice,
+    /// No invoice to verify (LUD-21's own words).
+    NoInvoice,
 }
 
 impl Fail {
@@ -46,6 +48,7 @@ impl Fail {
             Fail::RateLimited => 429,
             Fail::Unavailable => 503,
             Fail::BadInvoice => 502,
+            Fail::NoInvoice => 404,
         }
     }
 
@@ -56,6 +59,7 @@ impl Fail {
             Fail::RateLimited => "too many requests; try again in a minute".into(),
             Fail::Unavailable => "the Lightning node is not reachable right now; try again shortly".into(),
             Fail::BadInvoice => "the Lightning node returned an invoice that does not match the request".into(),
+            Fail::NoInvoice => "Not found".into(),
         }
     }
 }
@@ -243,6 +247,11 @@ impl NodeLink {
         tokio::time::timeout(limit, wait).await.is_ok()
     }
 
+    /// Whether the node answers `verify_invoice`.
+    pub fn verifies(&self) -> bool {
+        read(&self.cache).as_ref().is_some_and(|s| s.list.verifies)
+    }
+
     pub fn addresses(&self) -> Vec<AddressInfo> {
         read(&self.cache)
             .as_ref()
@@ -317,6 +326,15 @@ impl Metrics {
             recent_failures: lock(&self.recent).iter().rev().cloned().collect(),
         }
     }
+}
+
+/// An invoice the gateway checked and hands out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issued {
+    pub pr: String,
+    pub payment_hash: String,
+    /// Whether its node answers LUD-21 verification.
+    pub verifies: bool,
 }
 
 pub struct Directory {
@@ -425,7 +443,7 @@ impl Directory {
         domain: &str,
         amount_msat: u64,
         comment: Option<String>,
-    ) -> Result<String, Fail> {
+    ) -> Result<Issued, Fail> {
         let outcome = self.invoice_inner(name, domain, amount_msat, comment).await;
         match &outcome {
             Ok(_) => {
@@ -442,7 +460,7 @@ impl Directory {
         domain: &str,
         amount_msat: u64,
         comment: Option<String>,
-    ) -> Result<String, Fail> {
+    ) -> Result<Issued, Fail> {
         let started = Instant::now();
         let (i, addr, network) = self.find(name, domain).await?;
         if amount_msat < addr.min_sendable || amount_msat > addr.max_sendable {
@@ -490,12 +508,43 @@ impl Directory {
                 .map_or(description, |(fresh, _)| fresh.description);
             checked = self.check(node, &made.pr, name, domain, &description, amount_msat, network);
         }
-        if let Err(e) = checked {
+        let checked = checked.map_err(|e| {
             tracing::error!(%name, %domain, error = %e, "refused an invoice from the node");
-            return Err(Fail::BadInvoice);
-        }
+            Fail::BadInvoice
+        })?;
         self.metrics.latency(started.elapsed().as_millis() as u64);
-        Ok(made.pr)
+        Ok(Issued {
+            pr: made.pr,
+            // The hash of the invoice checked here, not the one the node named.
+            payment_hash: checked.payment_hash,
+            verifies: node.verifies(),
+        })
+    }
+
+    /// LUD-21: whether the invoice with `payment_hash` made for
+    /// `name@domain` was paid. The node's answer is checked: the invoice must
+    /// be for that hash, and a preimage must hash to it.
+    pub async fn verify(&self, name: &str, domain: &str, payment_hash: &str) -> Result<Verified, Fail> {
+        if !proto::valid_payment_hash(payment_hash) {
+            return Err(Fail::NoInvoice);
+        }
+        let (i, _, _) = self.find(name, domain).await.map_err(|f| match f {
+            Fail::NotFound => Fail::NoInvoice,
+            other => other,
+        })?;
+        let node = &self.nodes[i];
+        if !node.verifies() {
+            return Err(Fail::NoInvoice);
+        }
+        let args = json!(proto::VerifyInvoiceParams {
+            name: name.into(),
+            payment_hash: payment_hash.into(),
+        });
+        let v: Verified = node.call(proto::VERIFY_INVOICE, args).await.map_err(|e| match e {
+            CallError::Refused { code, .. } if code == code::NOT_FOUND || code == code::INVALID => Fail::NoInvoice,
+            _ => Fail::Unavailable,
+        })?;
+        checked_verification(v, payment_hash)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -508,7 +557,7 @@ impl Directory {
         description: &str,
         amount_msat: u64,
         network: Option<Network>,
-    ) -> Result<(), String> {
+    ) -> Result<bolt11::Checked, String> {
         let want = Expect {
             amount_msat,
             description_hash: lnurl::description_hash(&lnurl::metadata(name, domain, description)),
@@ -517,7 +566,7 @@ impl Directory {
             now: crate::unix_now(),
             min_expiry: Duration::from_secs(30),
         };
-        bolt11::check(pr, &want).map(|_| ())
+        bolt11::check(pr, &want)
     }
 
     pub async fn close(&self) {
@@ -525,6 +574,24 @@ impl Directory {
             n.close().await;
         }
     }
+}
+
+/// A node's answer to `verify_invoice`, if it holds up: the invoice is for
+/// `payment_hash`, and a settled one comes with a preimage that hashes to it.
+fn checked_verification(mut v: Verified, payment_hash: &str) -> Result<Verified, Fail> {
+    let for_hash = bolt11::payment_hash(&v.pr).is_some_and(|h| h == payment_hash);
+    let preimage_ok = v
+        .preimage
+        .as_deref()
+        .is_none_or(|p| hex::decode(p).is_ok_and(|p| hex::encode(lnurl::sha256(&p)) == payment_hash));
+    if !for_hash || !preimage_ok || (v.settled && v.preimage.is_none()) {
+        tracing::error!(%payment_hash, "refused a verification from the node");
+        return Err(Fail::BadInvoice);
+    }
+    if !v.settled {
+        v.preimage = None;
+    }
+    Ok(v)
 }
 
 /// Run futures concurrently and wait for all of them.
@@ -594,6 +661,56 @@ mod tests {
         drop(client);
         let list: AddressList = link.call(proto::LIST_ADDRESSES, json!({})).await.unwrap();
         assert_eq!(list.addresses.len(), 2);
+        s.stop().await;
+    }
+
+    #[test]
+    fn a_verification_must_be_for_the_hash_and_its_preimage() {
+        let preimage = [9u8; 32];
+        let pr = crate::bolt11::testutil::invoice_paying(1_000, [0; 32], preimage);
+        let hash = hex::encode(lnurl::sha256(&preimage));
+        let v = |settled: bool, preimage: Option<String>| Verified {
+            settled,
+            preimage,
+            pr: pr.clone(),
+        };
+        let good = Some(hex::encode(preimage));
+        assert_eq!(
+            checked_verification(v(true, good.clone()), &hash),
+            Ok(v(true, good.clone()))
+        );
+        // Not settled: no preimage is passed on, whatever the node said.
+        assert_eq!(checked_verification(v(false, good.clone()), &hash), Ok(v(false, None)));
+        assert_eq!(checked_verification(v(false, None), &hash), Ok(v(false, None)));
+        for bad in [
+            v(true, None),
+            v(true, Some("11".repeat(32))),
+            v(true, Some("zz".into())),
+            Verified {
+                pr: "lnbc1".into(),
+                ..v(false, None)
+            },
+        ] {
+            assert_eq!(checked_verification(bad, &hash), Err(Fail::BadInvoice));
+        }
+        assert_eq!(
+            checked_verification(v(false, None), &"00".repeat(32)),
+            Err(Fail::BadInvoice)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_node_gets_no_verify_url_and_no_verification() {
+        let s = crate::gateway::tests::stack().await;
+        let dir = &s.gw().dir;
+        let issued = dir.invoice("alice", "pay.example", 1_000, None).await.unwrap();
+        assert!(issued.verifies);
+        write(&dir.nodes[0].cache).as_mut().unwrap().list.verifies = false;
+        assert!(!dir.invoice("alice", "pay.example", 1_000, None).await.unwrap().verifies);
+        assert_eq!(
+            dir.verify("alice", "pay.example", &issued.payment_hash).await,
+            Err(Fail::NoInvoice)
+        );
         s.stop().await;
     }
 

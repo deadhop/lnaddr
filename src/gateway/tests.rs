@@ -191,6 +191,88 @@ async fn a_wallet_pays_a_lightning_address_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_verifies_the_payment_with_lud21() {
+    let s = stack().await;
+    let (status, inv) = s
+        .get("/.well-known/lnurlp/alice/callback?amount=21000&comment=order%2042")
+        .await;
+    assert_eq!(status, 200, "{inv}");
+    let pr = inv["pr"].as_str().unwrap();
+    let hash = crate::bolt11::payment_hash(pr).unwrap();
+    let verify = inv["verify"].as_str().unwrap();
+    assert_eq!(
+        verify,
+        format!("http://pay.example/.well-known/lnurlp/alice/verify/{hash}")
+    );
+    let path = verify.trim_start_matches("http://pay.example");
+    let r = s.http.get(format!("{}{path}", s.base())).send().await.unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({ "status": "OK", "settled": false, "preimage": null, "pr": pr })
+    );
+
+    s.node_rig.fake.pay(&hash);
+    tokio::time::sleep(Duration::from_secs(crate::node::service::CHECK_GAP_SECS)).await;
+    let (status, v) = s.get(path).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["settled"], true);
+    let preimage = hex::decode(v["preimage"].as_str().unwrap()).unwrap();
+    assert_eq!(hex::encode(lnurl::sha256(&preimage)), hash);
+
+    // The node's admin sees the payment, with its comment.
+    let admin = crate::node::app::tests::client(&s.node_rig, admin_keys(), &s.node_keys, Duration::from_secs(10)).await;
+    let list = admin.call_value("list_invoices", serde_json::json!({})).await.unwrap();
+    assert_eq!(list["invoices"][0]["comment"], "order 42");
+    assert_eq!(list["invoices"][0]["payment_hash"], hash);
+    let one = admin
+        .call_value("lookup_invoice", serde_json::json!({ "payment_hash": hash }))
+        .await
+        .unwrap();
+    assert_eq!(one["state"], "settled");
+    admin.close().await;
+
+    // Anything else is LUD-21's "Not found".
+    for path in [
+        format!("/.well-known/lnurlp/alice/verify/{}", "00".repeat(32)),
+        format!("/.well-known/lnurlp/bob/verify/{hash}"),
+        format!("/.well-known/lnurlp/nobody/verify/{hash}"),
+        "/.well-known/lnurlp/alice/verify/not-a-hash".to_string(),
+        format!("/.well-known/lnurlp/Bad%20Name/verify/{hash}"),
+    ] {
+        let (status, v) = s.get(&path).await;
+        assert_eq!(
+            (status, v),
+            (404, serde_json::json!({ "status": "ERROR", "reason": "Not found" })),
+            "{path}"
+        );
+    }
+
+    // A backend that cannot say makes the node unavailable, not "not paid".
+    let (_, inv) = s.get("/.well-known/lnurlp/alice/callback?amount=1000").await;
+    let other = crate::bolt11::payment_hash(inv["pr"].as_str().unwrap()).unwrap();
+    *s.node_rig.fake.fail.lock().unwrap() = Some((500, "down".into()));
+    let (status, v) = s.get(&format!("/.well-known/lnurlp/alice/verify/{other}")).await;
+    assert_eq!((status, v["status"].as_str()), (503, Some("ERROR")), "{v}");
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verification_polls_have_their_own_budget() {
+    let s = stack_with(Kind::Lnd, |c| {
+        c.limits.per_ip_per_minute = 1;
+    })
+    .await;
+    let path = format!("/.well-known/lnurlp/alice/verify/{}", "00".repeat(32));
+    for _ in 0..4 {
+        assert_eq!(s.get(&path).await.0, 404);
+    }
+    assert_eq!(s.get(&path).await.0, 429);
+    s.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_public_listener_serves_lnurl_paths_and_nothing_else() {
     let s = stack().await;
     let r = s
@@ -1218,6 +1300,16 @@ async fn a_gateway_that_never_reached_its_node_says_unavailable_not_unknown() {
     let http = crate::tls::http_client(Duration::from_secs(10));
     let r = http
         .get(format!("http://{}/.well-known/lnurlp/alice", gw.public))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    let r = http
+        .get(format!(
+            "http://{}/.well-known/lnurlp/alice/verify/{}",
+            gw.public,
+            "00".repeat(32)
+        ))
         .send()
         .await
         .unwrap();
